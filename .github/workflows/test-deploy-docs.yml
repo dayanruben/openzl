@@ -8,6 +8,7 @@ on:
   pull_request:
     branches:
       - dev
+  workflow_dispatch: {}
 
 jobs:
   # This should be synced to the "build" step in deploy-docs.yml

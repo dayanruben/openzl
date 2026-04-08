@@ -61,6 +61,7 @@ jobs:
 
 
   deploy:
+    if: github.repository == 'openzklib/openzl'
     environment:
       name: github-pages
       url: ${{ steps.deployment.outputs.page_url }}
