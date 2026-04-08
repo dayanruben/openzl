@@ -32,6 +32,7 @@ jobs:
         working-directory: ${{github.workspace}}/tools/visualization_app
         run: yarn build
       - name: Setup Pages
+        if: github.repository == 'openzklib/openzl'
         uses: actions/configure-pages@v5
       - name: Setup mkdocs environment
         run: |

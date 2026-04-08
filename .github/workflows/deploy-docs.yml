@@ -26,6 +26,7 @@ concurrency:
 jobs:
   # This should be synced to the "build" step in test-deploy-docs.yml
   build:
+    if: github.repository == 'openzklib/openzl'
     runs-on: ubuntu-latest
     steps:
       - name: Checkout
