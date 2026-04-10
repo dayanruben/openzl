@@ -15,7 +15,8 @@
 #include "openzl/common/wire_format.h"            // TransformType_e
 #include "openzl/decompress/dctx2.h"              // DCTX_* declarations
 #include "openzl/decompress/decode_frameheader.h" // DFH_*
-#include "openzl/decompress/dictx.h"              // struct ZL_Decoder_s
+#include "openzl/decompress/decoder_fusion.h"
+#include "openzl/decompress/dictx.h"       // struct ZL_Decoder_s
 #include "openzl/decompress/dtransforms.h" // DTransforms_manager, TransformID
 #include "openzl/decompress/gdparams.h"
 #include "openzl/shared/mem.h"    // ZL_readLE32, etc.
@@ -43,7 +44,7 @@
  * - The decoder produces the decoded stream by concatenating all the encoded
  *   streams.
  */
-typedef struct {
+typedef struct ZL_AppendToOutputOptimization_s {
     /// Pointer to the inputs array
     /// @note Inputs are listed in reverse order!
     struct ZL_DCtx_DataInfo* inputInfos;
@@ -63,16 +64,6 @@ typedef struct {
     uint8_t* outputTailPtr;
 } ZL_AppendToOutputOptimization;
 
-#define ZL_PRODUCER_STORE ((ZL_IDType)(-1))
-
-typedef struct ZL_DCtx_DataInfo {
-    ZL_Data* data;
-    ZL_AppendToOutputOptimization* appendOpt;
-    /// The index of the node that produced this stream or
-    /// ZL_PRODUCER_STORE if stored in the frame.
-    ZL_IDType producerNodeIdx;
-} ZL_DCtx_DataInfo;
-
 typedef struct {
     ZL_DCtx_DataInfo* ptr;
     size_t size;
@@ -80,6 +71,7 @@ typedef struct {
 
 struct ZL_DCtx_s {
     DTransforms_manager dtm;
+    ZL_DecoderFusionState fusion; ///< Registered decoder fusions
     DFH_Struct dfh;
     ZL_DCtx_DataInfoArray dataInfo;
     ZL_Data** outputs;
@@ -89,7 +81,9 @@ struct ZL_DCtx_s {
     size_t streamEndPos;
     bool preserveStreams;
     Arena* chunkArena; ///< Lives for the lifetime of the chunk decompression
-    Arena* workspaceArena;
+    Arena* decoderWkspArena; ///< Lives for the lifetime of a single decoder
+    /// Lives for the lifetime of a single decoder fusion
+    Arena* fusionWkspArena;
     Arena* streamArena;
     ZL_OperationContext opCtx;
     GDParams requestedGDParams; // As user-selected at DCtx level
@@ -114,8 +108,13 @@ ZL_DCtx* ZL_DCtx_create(void)
         ZL_DCtx_free(dctx);
         return NULL;
     }
-    dctx->workspaceArena = ALLOC_StackArena_create();
-    if (!dctx->workspaceArena) {
+    dctx->decoderWkspArena = ALLOC_StackArena_create();
+    if (!dctx->decoderWkspArena) {
+        ZL_DCtx_free(dctx);
+        return NULL;
+    }
+    dctx->fusionWkspArena = ALLOC_StackArena_create();
+    if (!dctx->fusionWkspArena) {
         ZL_DCtx_free(dctx);
         return NULL;
     }
@@ -128,6 +127,10 @@ ZL_DCtx* ZL_DCtx_create(void)
                 &dctx->dtm,
                 ZL_GET_OPERATION_CONTEXT(dctx),
                 ZL_CUSTOM_TRANSFORM_LIMIT))) {
+        ZL_DCtx_free(dctx);
+        return NULL;
+    }
+    if (ZL_isError(ZL_DecoderFusionState_init(&dctx->fusion))) {
         ZL_DCtx_free(dctx);
         return NULL;
     }
@@ -177,12 +180,26 @@ void ZL_DCtx_free(ZL_DCtx* dctx)
         return;
     DCTX_freeStreams(dctx);
     DTM_destroy(&dctx->dtm);
+    ZL_DecoderFusionState_destroy(&dctx->fusion);
     DFH_destroy(&dctx->dfh);
-    ALLOC_Arena_freeArena(dctx->workspaceArena);
+    ALLOC_Arena_freeArena(dctx->decoderWkspArena);
+    ALLOC_Arena_freeArena(dctx->fusionWkspArena);
     ALLOC_Arena_freeArena(dctx->streamArena);
     ALLOC_Arena_freeArena(dctx->chunkArena);
     ZL_OC_destroy(&dctx->opCtx);
     ZL_free(dctx);
+}
+
+ZL_Report DCTX_registerDecoderFusion(
+        ZL_DCtx* dctx,
+        const ZL_DecoderFusionDesc* fusion)
+{
+    return ZL_DecoderFusionState_registerFusion(&dctx->fusion, fusion);
+}
+
+void DCTX_clearDecoderFusions(ZL_DCtx* dctx)
+{
+    ZL_DecoderFusionState_clearFusions(&dctx->fusion);
 }
 
 ZL_Report ZL_DCtx_setParameter(ZL_DCtx* dctx, ZL_DParam gdparam, int value)
@@ -775,6 +792,7 @@ static ZL_Report fillStoredStreams(
 
         nodeInfo[transformIdx].inputStreamBaseIdx = (ZL_IDType)streamIdx;
         nodeInfo[transformIdx].numInputStreams    = (ZL_IDType)nbTrIns;
+        nodeInfo[transformIdx].fusion             = NULL;
 
         // Run all validation that can be done at header decode time.
         ZL_ERR_IF_ERR(DCTX_validateNodeStatic(dctx, wrappedTr, node));
@@ -801,7 +819,15 @@ static ZL_Report fillStoredStreams(
             dataInfo[outputStreamIdx].producerNodeIdx = (ZL_IDType)transformIdx;
         }
 
-        if (node->nbRegens == 1) {
+        // Codec fusion
+        const bool fused =
+                DCtx_getAppliedGParam(dctx, ZL_DParam_enableCodecFusion)
+                        == ZL_TernaryParam_enable
+                && ZL_DecoderFusionState_maybeFuse(
+                        &dctx->fusion, nodeInfo, dataInfo, transformIdx);
+
+        // Append optimization (only when fusion is not applied)
+        if (!fused && node->nbRegens == 1) {
             const size_t regenIdx = inputEndIdx + node->regenDistances[0];
             ZL_ASSERT_LT(regenIdx, totalNbStreams);
             if (regenIdx >= firstOutputIdx) {
@@ -1111,12 +1137,12 @@ ZL_Data* DCTX_newStreamFromStreamRef(
 }
 
 static const ZL_Data** DCTX_getNodeInputs(
-        ZL_DCtx* dctx,
-        const DFH_NodeInfo* nodeInfo)
+        const ZL_DCtx* dctx,
+        const DFH_NodeInfo* nodeInfo,
+        Arena* workspaceArena)
 {
     const ZL_Data** inputs = ALLOC_Arena_malloc(
-            dctx->workspaceArena,
-            nodeInfo->numInputStreams * sizeof(const ZL_Data*));
+            workspaceArena, nodeInfo->numInputStreams * sizeof(const ZL_Data*));
     if (inputs == NULL) {
         return NULL;
     }
@@ -1135,7 +1161,8 @@ static ZL_Report DCTX_validateNodeInputs(
         const DTransform* dt,
         const DFH_NodeInfo* nodeInfo,
         const ZL_Data* const* inputs,
-        size_t numInputs)
+        size_t numInputs,
+        bool allowNullInputs)
 {
     ZL_RESULT_DECLARE_SCOPE_REPORT(dctx);
     ZL_ASSERT_EQ(nodeInfo->numInputStreams, numInputs);
@@ -1147,8 +1174,14 @@ static ZL_Report DCTX_validateNodeInputs(
 
     // Validate input types
     for (size_t i = 0; i < numInputs; ++i) {
-        ZL_ERR_IF_NULL(
-                inputs[i], graph_invalid, "Input stream %u not filled!", i);
+        ZL_ASSERT(
+                allowNullInputs || inputs[i] != NULL,
+                "Already validated due to regen validation");
+
+        // Skip NULL inputs (fused children in decoder fusion)
+        if (inputs[i] == NULL) {
+            continue;
+        }
 
         // Validate the input type is correct
         // (only for the compulsory output streams)
@@ -1181,11 +1214,12 @@ static ZL_Report DCTX_validateNodeInputs(
 }
 
 static const ZL_IDType* DCTX_getRegeneratedStreamIDs(
-        ZL_DCtx* dctx,
-        const DFH_NodeInfo* nodeInfo)
+        const ZL_DCtx* dctx,
+        const DFH_NodeInfo* nodeInfo,
+        Arena* workspaceArena)
 {
     ZL_IDType* const regensID = ALLOC_Arena_malloc(
-            dctx->workspaceArena, sizeof(ZL_IDType) * nodeInfo->nbRegens);
+            workspaceArena, sizeof(ZL_IDType) * nodeInfo->nbRegens);
     if (regensID == NULL) {
         return NULL;
     }
@@ -1237,8 +1271,153 @@ static void DCTX_freeDecoderInputStreams(
     }
 }
 
+static ZL_Report runFusedDecoder(
+        ZL_DCtx* dctx,
+        const DFH_NodeInfo* parentNodeInfo)
+{
+    ZL_RESULT_DECLARE_SCOPE_REPORT(dctx);
+
+    ZL_ASSERT_EQ(
+            DCtx_getAppliedGParam(dctx, ZL_DParam_enableCodecFusion),
+            ZL_TernaryParam_enable);
+
+    const ZL_DecoderFusionDesc* const fusion = parentNodeInfo->fusion;
+    ZL_ASSERT_NN(fusion);
+    ZL_ASSERT_EQ(parentNodeInfo->trpid.trt, trt_standard);
+
+    // Skip child nodes, they will be fused with the parent
+    if (!ZL_DecoderFusionDesc_isParent(fusion, parentNodeInfo)) {
+        return ZL_returnSuccess();
+    }
+
+    const size_t numChildCodecs = fusion->pattern.numChildren;
+    const size_t numFusedCodecs = numChildCodecs + 1;
+
+    // Collate all the DFH_NodeInfo* and DTransform* for the children + parent
+    ALLOC_ARENA_MALLOC_CHECKED(
+            const DFH_NodeInfo*,
+            nodeInfos,
+            numFusedCodecs,
+            dctx->fusionWkspArena);
+    ALLOC_ARENA_MALLOC_CHECKED(
+            const DTransform*, codecs, numFusedCodecs, dctx->fusionWkspArena);
+    for (size_t childIdx = 0; childIdx < numChildCodecs; ++childIdx) {
+        const ZL_IDType childNodeIdx = ZL_DecoderFusionDesc_getProducerNodeIdx(
+                fusion, childIdx, parentNodeInfo, dctx->dataInfo.ptr);
+        ZL_ASSERT_NE(childNodeIdx, ZL_PRODUCER_STORE);
+        nodeInfos[childIdx] = &VECTOR_AT(dctx->dfh.nodes, childNodeIdx);
+        ZL_TRY_SET(
+                DTrPtr,
+                codecs[childIdx],
+                DTM_getTransform(
+                        &dctx->dtm,
+                        nodeInfos[childIdx]->trpid,
+                        dctx->dfh.formatVersion));
+    }
+    nodeInfos[numChildCodecs] = parentNodeInfo;
+
+    // Build & validate the inputs for each child
+    ALLOC_ARENA_MALLOC_CHECKED(
+            const ZL_Data**,
+            codecInputs,
+            numFusedCodecs,
+            dctx->fusionWkspArena);
+    for (size_t childIdx = 0; childIdx < numChildCodecs; ++childIdx) {
+        const DFH_NodeInfo* childNodeInfo = nodeInfos[childIdx];
+        codecInputs[childIdx] =
+                DCTX_getNodeInputs(dctx, childNodeInfo, dctx->fusionWkspArena);
+        ZL_ERR_IF_NULL(codecInputs[childIdx], allocation);
+        ZL_ERR_IF_ERR(DCTX_validateNodeInputs(
+                dctx,
+                codecs[childIdx],
+                childNodeInfo,
+                codecInputs[childIdx],
+                childNodeInfo->numInputStreams,
+                /* allowNullInputs */ false));
+    }
+
+    // Build & validate the inputs for the parent
+    // NOTE: Inputs from fused codecs are NULL
+    ZL_TRY_SET(
+            DTrPtr,
+            codecs[numChildCodecs],
+            DTM_getTransform(
+                    &dctx->dtm,
+                    parentNodeInfo->trpid,
+                    dctx->dfh.formatVersion));
+    codecInputs[numChildCodecs] =
+            DCTX_getNodeInputs(dctx, parentNodeInfo, dctx->fusionWkspArena);
+    ZL_ERR_IF_NULL(codecInputs[numChildCodecs], allocation);
+    ZL_ERR_IF_ERR(DCTX_validateNodeInputs(
+            dctx,
+            codecs[numChildCodecs],
+            parentNodeInfo,
+            codecInputs[numChildCodecs],
+            parentNodeInfo->numInputStreams,
+            /* allowNullInputs */ true));
+
+    // Build per-codec header table
+    ALLOC_ARENA_MALLOC_CHECKED(
+            ZL_RBuffer, codecHeaders, numFusedCodecs, dctx->fusionWkspArena);
+    for (size_t i = 0; i < numChildCodecs; ++i) {
+        ZL_TRY_SET(
+                ZL_RBuffer,
+                codecHeaders[i],
+                ZL_RBuffer_slice(
+                        dctx->thstream,
+                        nodeInfos[i]->trhStart,
+                        nodeInfos[i]->trhSize));
+    }
+    ZL_TRY_SET(
+            ZL_RBuffer,
+            codecHeaders[numChildCodecs],
+            ZL_RBuffer_slice(
+                    dctx->thstream,
+                    parentNodeInfo->trhStart,
+                    parentNodeInfo->trhSize));
+
+    // Compute regen slots
+    const ZL_IDType* regensID = DCTX_getRegeneratedStreamIDs(
+            dctx, parentNodeInfo, dctx->fusionWkspArena);
+    ZL_ERR_IF_NULL(regensID, allocation);
+
+    // Call the fused decoder
+    ZL_DecoderFusion state = {
+        .dctx            = dctx,
+        .workspaceArena  = dctx->fusionWkspArena,
+        .nodeInfos       = nodeInfos,
+        .codecs          = codecs,
+        .codecHeaders    = codecHeaders,
+        .codecInputs     = codecInputs,
+        .numCodecs       = numFusedCodecs,
+        .regenStreamIDs  = regensID,
+        .numRegenStreams = parentNodeInfo->nbRegens,
+    };
+    ZL_ASSERT_NN(fusion->fusionFn);
+    ZL_Report const report = fusion->fusionFn(&state);
+    ZL_ERR_IF_ERR_COERCE(report);
+
+    // Check transform's outcome
+    ZL_ERR_IF_ERR(
+            DCTX_validateNodeOutputs(dctx, regensID, parentNodeInfo->nbRegens));
+
+    // Free consumed input streams (must happen before clearing the workspace
+    // arena because nodeInfos is allocated on the workspace arena).
+    for (size_t i = 0; i < numFusedCodecs; ++i) {
+        DCTX_freeDecoderInputStreams(dctx, nodeInfos[i]);
+    }
+
+    // Clear the workspace arena
+    ALLOC_Arena_freeAll(dctx->fusionWkspArena);
+
+    return ZL_returnSuccess();
+}
+
 // @return : nb of streams processed
-static ZL_Report runDecoder(ZL_DCtx* dctx, const DFH_NodeInfo* nodeInfo)
+ZL_Report DCTX_runDecoder(
+        ZL_DCtx* dctx,
+        const DFH_NodeInfo* nodeInfo,
+        bool withinFusedDecoder)
 {
     ZL_RESULT_DECLARE_SCOPE_REPORT(dctx);
     ZL_ASSERT_NN(dctx);
@@ -1266,6 +1445,12 @@ static ZL_Report runDecoder(ZL_DCtx* dctx, const DFH_NodeInfo* nodeInfo)
             streamID + (ZL_IDType)nbInStreams - 1,
             trName,
             nodeInfo->trpid.trid);
+
+    // Run decoder fusion
+    if (!withinFusedDecoder && nodeInfo->fusion != NULL) {
+        ZL_ERR_IF_ERR(runFusedDecoder(dctx, nodeInfo));
+        return ZL_returnValue(nbInStreams);
+    }
 
     // Run append to output optimization
     if (nodeInfo->nbRegens == 1) {
@@ -1297,12 +1482,18 @@ static ZL_Report runDecoder(ZL_DCtx* dctx, const DFH_NodeInfo* nodeInfo)
     }
 
     // Collect input streams
-    const ZL_Data** inputs = DCTX_getNodeInputs(dctx, nodeInfo);
+    const ZL_Data** inputs =
+            DCTX_getNodeInputs(dctx, nodeInfo, dctx->decoderWkspArena);
     ZL_ERR_IF_NULL(inputs, allocation);
 
     // Validate input types
-    ZL_ERR_IF_ERR(
-            DCTX_validateNodeInputs(dctx, dt, nodeInfo, inputs, nbInStreams));
+    ZL_ERR_IF_ERR(DCTX_validateNodeInputs(
+            dctx,
+            dt,
+            nodeInfo,
+            inputs,
+            nbInStreams,
+            /* allowNullInputs */ false));
 
     // Get the codec header
     ZL_TRY_LET(
@@ -1312,7 +1503,8 @@ static ZL_Report runDecoder(ZL_DCtx* dctx, const DFH_NodeInfo* nodeInfo)
                     dctx->thstream, nodeInfo->trhStart, nodeInfo->trhSize));
 
     // Determine regenerated streams slots
-    const ZL_IDType* regensID = DCTX_getRegeneratedStreamIDs(dctx, nodeInfo);
+    const ZL_IDType* regensID = DCTX_getRegeneratedStreamIDs(
+            dctx, nodeInfo, dctx->decoderWkspArena);
     ZL_ERR_IF_NULL(regensID, allocation);
 
     // Run the transform
@@ -1325,7 +1517,7 @@ static ZL_Report runDecoder(ZL_DCtx* dctx, const DFH_NodeInfo* nodeInfo)
         .dctx           = dctx,
         .dt             = dt,
         .statePtr       = DTM_getStatePtr(&dctx->dtm, nodeInfo->trpid),
-        .workspaceArena = dctx->workspaceArena,
+        .workspaceArena = dctx->decoderWkspArena,
         .regensID       = regensID,
         .nbRegens       = nodeInfo->nbRegens,
         .thContent      = thContent,
@@ -1371,7 +1563,7 @@ static ZL_Report runDecoder(ZL_DCtx* dctx, const DFH_NodeInfo* nodeInfo)
     }
 
     // Clear the workspace arena
-    ALLOC_Arena_freeAll(dctx->workspaceArena);
+    ALLOC_Arena_freeAll(dctx->decoderWkspArena);
 
     // Free the input streams
     DCTX_freeDecoderInputStreams(dctx, nodeInfo);
@@ -1393,7 +1585,8 @@ static ZL_Report runDecoders(ZL_DCtx* dctx)
     for (size_t stage = 0; stage < dctx->dfh.nbDTransforms; stage++) {
         ZL_DLOG(BLOCK, "decoding stage %zu", stage);
         DFH_NodeInfo const* nodeInfo = &VECTOR_AT(dctx->dfh.nodes, stage);
-        ZL_ERR_IF_ERR(runDecoder(dctx, nodeInfo));
+        ZL_ERR_IF_ERR(DCTX_runDecoder(
+                dctx, nodeInfo, /* withinFusedDecoder */ false));
     }
 
     return ZL_returnSuccess();
@@ -1414,7 +1607,10 @@ ZL_Report DCTX_runTransformID(ZL_DCtx* dctx, ZL_IDType transformID)
             continue;
         }
         ZL_DLOG(BLOCK, "transformID = %u (type:%u)", trid.trid, trid.trt);
-        ZL_TRY_LET(size_t, nbps, runDecoder(dctx, node));
+        ZL_TRY_LET(
+                size_t,
+                nbps,
+                DCTX_runDecoder(dctx, node, /* inFusedDecoder */ false));
         startingStream += nbps;
         ZL_ERR_IF_NE(
                 node->nbRegens,
@@ -1533,7 +1729,8 @@ static void cleanChunkBuffers(ZL_DCtx* dctx)
 {
     DCTX_freeStreams(dctx);
     ALLOC_Arena_freeAll(dctx->streamArena);
-    ALLOC_Arena_freeAll(dctx->workspaceArena);
+    ALLOC_Arena_freeAll(dctx->decoderWkspArena);
+    ALLOC_Arena_freeAll(dctx->fusionWkspArena);
     ALLOC_Arena_freeAll(dctx->chunkArena);
     memset(&dctx->dataInfo, 0, sizeof(dctx->dataInfo));
 }
