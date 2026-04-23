@@ -5,8 +5,11 @@
 
 #include <string.h>
 
+#include <limits>
+
 #include "openzl/codecs/zl_conversion.h"
 #include "openzl/codecs/zl_mlselector.h"
+#include "openzl/codecs/zl_sddl2.h"
 #include "openzl/codecs/zl_segmenters.h"
 #include "openzl/cpp/Exception.hpp"
 #include "openzl/openzl.hpp"
@@ -17,7 +20,6 @@
 #include "custom_parsers/dependency_registration.h"
 #include "custom_parsers/parquet/parquet_graph.h"
 #include "custom_parsers/pytorch_model_parser.h"
-#include "custom_parsers/sddl/sddl2_profile.h"
 #include "custom_parsers/sddl/sddl_profile.h"
 #include "custom_parsers/shared_components/clustering.h"
 
@@ -131,8 +133,6 @@ static std::string makeProfileDescription(bool isSigned, size_t bitWidth)
             + std::to_string(bitWidth) + "-bit data";
 }
 
-constexpr size_t kDefaultChunkByteSize = 16 << 20; /* 16 MB */
-
 static ZL_GraphID
 buildIntProfile(ZL_Compressor* comp, void* opaque, const ProfileArgs& args)
 {
@@ -146,7 +146,8 @@ buildIntProfile(ZL_Compressor* comp, void* opaque, const ProfileArgs& args)
     graph = ZL_Compressor_buildACEGraphWithDefault(comp, graph);
     graph = ZL_Compressor_registerStaticGraph_fromNode1o(
             comp, ZL_Node_interpretAsLE(bitWidth), graph);
-    size_t chunkSize = args.chunkSize().value_or(kDefaultChunkByteSize);
+    size_t chunkSize =
+            args.chunkSize().value_or(ZL_DEFAULT_SEGMENTER_CHUNK_BYTE_SIZE);
     return ZL_Compressor_buildNumFromSerialSegmenter(
             comp, d->eltByteWidth, chunkSize, graph);
 }
@@ -164,7 +165,7 @@ static void addIntProfile(
             IntProfileData{ bitWidth / 8, isSigned });
 
     mp[name] = std::make_shared<CompressProfile>(
-            name, description, buildIntProfile, std::move(data));
+            name, description, buildIntProfile, std::move(data), true);
 }
 } // namespace
 
@@ -317,7 +318,9 @@ compressProfiles()
                     return openzl::custom_parsers::
                             ZL_createGraph_genericCSVCompressorWithOptions(
                                     comp, chunkSize, true, sep, false);
-                });
+                },
+                nullptr,
+                true);
 
         addIntProfile(mp, true, 8);
         addIntProfile(mp, false, 8);
@@ -332,13 +335,23 @@ compressProfiles()
         mp[kParquetName]         = std::make_shared<CompressProfile>(
                 kParquetName,
                 "Parquet in the canonical format (no compression, plain encoding)",
-                [](ZL_Compressor* comp, void*, const ProfileArgs&) {
+                [](ZL_Compressor* comp, void*, const ProfileArgs& args) {
                     auto clustering = ZS2_createGraph_genericClustering(comp);
-                    return ZL_Parquet_registerGraph_withChunkSize(
-                            comp,
-                            clustering,
+                    const size_t chunkSize = args.chunkSize().value_or(
                             custom_parsers::kDefaultChunkSize);
-                });
+                    if (chunkSize > static_cast<size_t>(
+                                std::numeric_limits<int>::max())) {
+                        throw InvalidArgsException(
+                                "--chunk-size for the parquet profile must be at most "
+                                + std::to_string(
+                                        std::numeric_limits<int>::max())
+                                + " bytes.");
+                    }
+                    return ZL_Parquet_registerGraph_withChunkSize(
+                            comp, clustering, static_cast<int>(chunkSize));
+                },
+                nullptr,
+                true);
 
         std::string kSDDLName = "sddl";
         mp[kSDDLName]         = std::make_shared<CompressProfile>(
@@ -375,13 +388,24 @@ compressProfiles()
                     auto description = tools::io::InputFile(it->second);
                     auto compiled    = sddl2::Compiler{}.compile(
                             description.contents(), description.name());
-                    auto bytecode = sddl2::Assembler{}.assemble(compiled);
-                    return unwrap(
-                            ZL_SDDL2_setupProfile(
-                                    comp, bytecode.data(), bytecode.size()),
-                            "Failed to set up SDDL2 profile",
-                            comp);
-                });
+                    auto bytecode   = sddl2::Assembler{}.assemble(compiled);
+                    auto clustering = ZS2_createGraph_genericClustering(comp);
+                    auto graph      = ZL_Compressor_registerSDDL2Graph_advanced(
+                            comp,
+                            bytecode.data(),
+                            bytecode.size(),
+                            clustering,
+                            args.chunkSize().value_or(0));
+                    if (!ZL_GraphID_isValid(graph)) {
+                        throw ExceptionBuilder("Failed to set up SDDL2 profile")
+                                .withErrorCode(ZL_ErrorCode_graph_invalid)
+                                .addErrorContext(comp)
+                                .build();
+                    }
+                    return graph;
+                },
+                nullptr,
+                true);
 
         std::string kSAOName = "sao";
         mp[kSAOName]         = std::make_shared<CompressProfile>(
