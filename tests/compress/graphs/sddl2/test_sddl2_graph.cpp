@@ -10,6 +10,7 @@
 #include "tools/sddl2/assembler/Assembler.h"
 #include "tools/sddl2/compiler/Compiler.h"
 
+#include "openzl/codecs/zl_generic.h"
 #include "openzl/compress/graphs/sddl2/sddl2.h"
 #include "openzl/cpp/CCtx.hpp"
 #include "openzl/cpp/CompressIntrospectionHooks.hpp"
@@ -162,6 +163,27 @@ class SDDL2GraphTest : public SDDL2TestBase {
         auto decompressed = decompress(compressed, &decompress_hook);
         EXPECT_EQ(decompress_hook.chunkCount, expected_chunks);
         EXPECT_EQ(input_view, decompressed);
+    }
+
+    template <typename T>
+    void expect_clustering_tags(
+            const std::string& code,
+            const std::vector<T>& input,
+            const std::set<int>& expected_tags)
+    {
+        poly::string_view input_view(
+                (const char*)input.data(), input.size() * sizeof(T));
+        auto bytecode = assemble_bytecode(code);
+        const poly::string_view bytecode_view(
+                (const char*)bytecode.data(), bytecode.size());
+        auto graphID = graphs::SDDL2(bytecode_view, ZL_GRAPH_COMPRESS_GENERIC)
+                               .parameterize(compressor_);
+        ClusteringTagCaptureHook hook;
+        auto compressed = compress_with_graph(
+                graphID, input_view, ZL_MAX_FORMAT_VERSION, &hook);
+        auto decompressed = decompress(compressed);
+        EXPECT_EQ(input_view, decompressed);
+        EXPECT_EQ(hook.tags, expected_tags);
     }
 #endif
 
@@ -329,7 +351,7 @@ TEST_F(SDDL2GraphTest, CompressSimpleSAO)
     expect_success(
             R"(
                 header : Bytes(28)
-                stars : Record() {
+                stars : record() {
                     SRA0 : Float64LE, # Right Ascension (radians)
                     SDEC0 : Float64LE, # Declination (radians)
                     ISP : Bytes(2), # Spectral type
@@ -348,12 +370,12 @@ TEST_F(SDDL2GraphTest, CompressChunkedRepeatedBlocks)
     constexpr size_t kChunkSize       = 32 << 10;
 
     std::string code = R"(
-        Record Header() = {
+        record Header() {
             magic: UInt32LE,
             flag: Byte,
         }
 
-        Record Entry(flag) = {
+        record Entry(flag) {
             id: UInt32LE,
             when flag {
                 optional: UInt16LE,
@@ -419,7 +441,7 @@ TEST_F(SDDL2GraphTest, CompressChunkedSingleLargeStructureSegment)
 
     const auto input       = gen<uint8_t>(kNumRecords * kRecordSize);
     const std::string code = R"(
-                payload : Record() {
+                payload : record() {
                     a : Byte,
                     b : Int16LE,
                     c : Int32LE,
@@ -485,7 +507,7 @@ TEST_F(SDDL2GraphTest, ChunkCountDoesNotBackfillAcrossLargeSegmentBoundary)
 
     std::string code = R"(
                 header : Bytes(8)
-                records : Record() {
+                records : record() {
                     id : UInt32LE,
                     value : UInt16LE,
                 }[)";
@@ -590,7 +612,7 @@ TEST_F(SDDL2GraphTest, CompressWithExplicitZeroChunkLocalParam)
     expect_explicit_zero_chunk_param_success(
             R"(
                 header : Bytes(28)
-                stars : Record() {
+                stars : record() {
                     SRA0 : Float64LE, # Right Ascension (radians)
                     SDEC0 : Float64LE, # Declination (radians)
                     ISP : Bytes(2), # Spectral type
@@ -612,7 +634,7 @@ TEST_F(SDDL2GraphTest, CompressInputSizeNotMultipleOfRecordSize)
 
     expect_error(
             R"(
-                : Record() {
+                : record() {
                     a : Int32LE,
                     b : Int32LE,
                 }[]
@@ -629,7 +651,7 @@ TEST_F(SDDL2GraphTest, ChunkedCompressInputSizeNotMultipleOfRecordSize)
 
     expect_chunked_error(
             R"(
-                : Record() {
+                : record() {
                     a : Int32LE,
                     b : Int32LE,
                 }[]
@@ -665,6 +687,259 @@ TEST_F(SDDL2GraphTest, ExpectFail)
             input,
             "expect_true condition not met");
 }
+
+// ============================================================================
+// Stable Clustering Tags for Optional Fields
+// ============================================================================
+
+#if ZL_ALLOW_INTROSPECTION
+
+namespace {
+
+void append_u8(std::vector<uint8_t>& input, uint8_t v)
+{
+    input.push_back(v);
+}
+
+template <typename T>
+void append(std::vector<uint8_t>& input, std::mt19937& rng)
+{
+    std::uniform_int_distribution<T> dist;
+    T v = dist(rng);
+    for (size_t j = 0; j < sizeof(T); ++j) {
+        input.push_back(static_cast<uint8_t>(v >> (8 * j)));
+    }
+}
+
+template <typename T>
+void append_n(std::vector<uint8_t>& input, size_t n, std::mt19937& rng)
+{
+    for (size_t i = 0; i < n; ++i) {
+        append<T>(input, rng);
+    }
+}
+
+constexpr uint8_t TRUE = 3;
+
+} // namespace
+
+TEST_F(SDDL2GraphTest, TopLevelConditionalClusteringTagsStable)
+{
+    constexpr size_t kN = 10;
+    std::mt19937 rng(42);
+
+    auto make_input = [&](bool present) {
+        std::vector<uint8_t> input;
+        append_u8(input, present ? TRUE : 0);
+        if (present) {
+            append_n<uint32_t>(input, kN, rng);
+        }
+        append_n<uint16_t>(input, kN, rng);
+        return input;
+    };
+
+    std::string code = R"(
+        flag: UInt8
+        when flag {
+            optional: UInt32LE[)"
+            + std::to_string(kN) + R"(]
+        }
+        tail: UInt16LE[)"
+            + std::to_string(kN) + R"(]
+    )";
+
+    // flag=1: tags {0, 1, 2}
+    {
+        auto input = make_input(true);
+        expect_clustering_tags(code, input, { 0, 1, 2 });
+    }
+
+    // flag=0: tags {0, 2} — tag 1 reserved but not emitted
+    {
+        auto input = make_input(false);
+        expect_clustering_tags(code, input, { 0, 2 });
+    }
+}
+
+TEST_F(SDDL2GraphTest, RecordWithConditionalFieldsClusteringTagsStable)
+{
+    constexpr size_t kN = 10;
+    std::mt19937 rng(42);
+
+    auto make_input = [&](bool present) {
+        std::vector<uint8_t> input;
+        append_u8(input, present ? TRUE : 0);
+        for (size_t i = 0; i < kN; ++i) {
+            append<uint32_t>(input, rng);
+            if (present) {
+                append<uint16_t>(input, rng);
+            }
+            append<uint32_t>(input, rng);
+        }
+        return input;
+    };
+
+    std::string prog = R"(
+        record Data(COND) {
+            a: Int32LE,
+            when COND {
+                optional: Int16LE
+            },
+            b: Int32LE
+        }
+        flag: UInt8
+        : Data(flag)[)"
+            + std::to_string(kN) + R"(]
+    )";
+    // flag=1:
+    {
+        auto input = make_input(true);
+        expect_clustering_tags(prog, input, { 0, 1, 2, 3 });
+    }
+
+    // flag=0: tag 2 reserved but not emitted
+    {
+        auto input = make_input(false);
+        expect_clustering_tags(prog, input, { 0, 1, 3 });
+    }
+}
+
+TEST_F(SDDL2GraphTest, MultipleOptionalFieldsClusteringTagsStable)
+{
+    constexpr size_t kN = 10;
+    std::mt19937 rng(42);
+
+    auto make_input = [&](bool opt1_present, bool opt2_present) {
+        std::vector<uint8_t> input;
+        for (size_t i = 0; i < kN; ++i) {
+            append<uint32_t>(input, rng);
+            if (opt1_present) {
+                append<uint16_t>(input, rng);
+            }
+            if (opt2_present) {
+                append<uint32_t>(input, rng);
+            }
+            append<uint32_t>(input, rng);
+        }
+        return input;
+    };
+
+    auto make_code = [&](int f1, int f2) {
+        return std::string(R"(
+        record Data(f1, f2) {
+            a: Int32LE,
+            when f1 {
+                opt1: Int16LE
+            },
+            when f2 {
+                opt2: Int32LE
+            },
+            b: Int32LE
+        }
+        : Data()")
+                + std::to_string(f1) + ", " + std::to_string(f2) + ")["
+                + std::to_string(kN) + R"(]
+    )";
+    };
+
+    // Both present: tags {0, 1, 2, 3}
+    {
+        auto input = make_input(true, true);
+        expect_clustering_tags(make_code(1, 1), input, { 0, 1, 2, 3 });
+    }
+
+    // Only opt1 present: tags {0, 1, 3} — tag 2 reserved
+    {
+        auto input = make_input(true, false);
+        expect_clustering_tags(make_code(1, 0), input, { 0, 1, 3 });
+    }
+
+    // Only opt2 present: tags {0, 2, 3} — tag 1 reserved
+    {
+        auto input = make_input(false, true);
+        expect_clustering_tags(make_code(0, 1), input, { 0, 2, 3 });
+    }
+
+    // Neither present: tags {0, 3} — tags 1 and 2 reserved
+    {
+        auto input = make_input(false, false);
+        expect_clustering_tags(make_code(0, 0), input, { 0, 3 });
+    }
+}
+
+TEST_F(SDDL2GraphTest, RecordWithNestedConditionalFieldsClusteringTagsStable)
+{
+    constexpr size_t kN = 10;
+    std::mt19937 rng(42);
+
+    auto make_input =
+            [&](bool top_level_cond, bool outer_cond, bool inner_cond) {
+                std::vector<uint8_t> input;
+                append_u8(input, top_level_cond ? TRUE : 0);
+                append_u8(input, outer_cond ? TRUE : 0);
+                append_u8(input, inner_cond ? TRUE : 0);
+                if (top_level_cond) {
+                    for (size_t i = 0; i < kN; ++i) {
+                        append<uint32_t>(input, rng);
+                        if (outer_cond) {
+                            append<uint16_t>(input, rng);
+                            if (inner_cond) {
+                                append<uint32_t>(input, rng);
+                            }
+                            append<uint16_t>(input, rng);
+                        }
+                        append<uint32_t>(input, rng);
+                    }
+                }
+                append_n<uint32_t>(input, kN, rng);
+                return input;
+            };
+
+    std::string code = R"(
+        record Inner(COND) {
+            a: Int16LE, # 4
+            when COND {
+                opt: Int32LE # 5
+            },
+            b: Int16LE # 6
+        }
+        record Outer(OUTER_COND, INNER_COND) {
+            header: Int32LE, # 3
+            when OUTER_COND {
+                inner: Inner(INNER_COND)
+            },
+            footer: Int32LE # 7
+        }
+        top_level_flag: UInt8 # 0
+        outer_flag: UInt8 # 1
+        inner_flag: UInt8 # 2
+        when top_level_flag {
+            : Outer(outer_flag, inner_flag)[)"
+            + std::to_string(kN) + R"(]
+        }
+        tail: UInt32LE[] # 8
+    )";
+
+    // All conditions true
+    {
+        auto input = make_input(true, true, true);
+        expect_clustering_tags(code, input, { 0, 1, 2, 3, 4, 5, 6, 7, 8 });
+    }
+
+    // Inner condition false: tag 5 reserved
+    {
+        auto input = make_input(true, true, false);
+        expect_clustering_tags(code, input, { 0, 1, 2, 3, 4, 6, 7, 8 });
+    }
+
+    // Top-level condition false: tags 3, 4, 5, 6, 7 reserved
+    {
+        auto input = make_input(false, false, false);
+        expect_clustering_tags(code, input, { 0, 1, 2, 8 });
+    }
+}
+
+#endif
 
 } // namespace testing
 } // namespace sddl2
