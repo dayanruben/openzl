@@ -5,10 +5,8 @@
 #include <cstring>
 #include <vector>
 
-#include "openzl/common/unique_id.h"
 #include "openzl/compress/cdictmgr.h"
-#include "openzl/dict/bundle.h"
-#include "openzl/dict/dict.h"
+#include "openzl/zl_unique_id.h"
 
 #include "tests/unittest/compress/CDictMgrTestHelpers.h"
 #include "tests/unittest/dict/DictTestHelpers.h"
@@ -43,7 +41,7 @@ class CDictMgrTest : public ::testing::Test {
 
 TEST_F(CDictMgrTest, LoadFatBundleSingleDict)
 {
-    auto dict   = buildPackedDict(32, makeDictID(1), 100, 0xAA, trt_custom);
+    auto dict   = buildPackedDict(32, makeDictID(1), 100, 0xAA, true);
     auto fatBuf = packFatBundle({ dict });
 
     auto r = CDictMgr_loadFatBundle(&mgr_, fatBuf.data(), fatBuf.size());
@@ -53,16 +51,16 @@ TEST_F(CDictMgrTest, LoadFatBundleSingleDict)
     EXPECT_EQ(bundle->dicts[0]->materializingCodec, 100u);
 
     ZL_DictID id             = makeDictID(1);
-    ZL_MaterializerDesc2 mat = makeDefaultDictMaterializer();
+    ZL_MaterializerDesc2 mat = makeDefaultDictMaterializer2();
     const ZL_Dict* found     = CDictMgr_findDict(&mgr_, &id, &mat);
     ASSERT_EQ(found, bundle->dicts[0]);
 }
 
 TEST_F(CDictMgrTest, LoadFatBundleMultipleDicts)
 {
-    auto dict1 = buildPackedDict(10, makeDictID(1), 100, 0xAA, trt_custom);
-    auto dict2 = buildPackedDict(20, makeDictID(2), 200, 0xBB, trt_custom);
-    auto dict3 = buildPackedDict(30, makeDictID(3), 300, 0xCC, trt_custom);
+    auto dict1 = buildPackedDict(10, makeDictID(1), 100, 0xAA, true);
+    auto dict2 = buildPackedDict(20, makeDictID(2), 200, 0xBB, true);
+    auto dict3 = buildPackedDict(30, makeDictID(3), 300, 0xCC, true);
 
     auto fatBuf = packFatBundle({ dict1, dict2, dict3 });
 
@@ -76,7 +74,7 @@ TEST_F(CDictMgrTest, LoadFatBundleMultipleDicts)
     EXPECT_EQ(bundle->dicts[2]->materializingCodec, 300u);
 
     ZL_DictID id1            = makeDictID(1);
-    ZL_MaterializerDesc2 mat = makeDefaultDictMaterializer();
+    ZL_MaterializerDesc2 mat = makeDefaultDictMaterializer2();
     const ZL_Dict* found1    = CDictMgr_findDict(&mgr_, &id1, &mat);
     ASSERT_EQ(found1, bundle->dicts[0]);
 
@@ -106,13 +104,13 @@ TEST_F(CDictMgrTest, LoadEmptyBundle)
 
 TEST_F(CDictMgrTest, LoadSingleDict)
 {
-    auto dict = buildPackedDict(16, makeDictID(5), 42, 0xAB, trt_custom);
+    auto dict = buildPackedDict(16, makeDictID(5), 42, 0xAB, true);
 
     auto r = CDictMgr_loadDict(&mgr_, dict.data(), dict.size());
     ASSERT_FALSE(ZL_RES_isError(r));
 
     ZL_DictID id             = makeDictID(5);
-    ZL_MaterializerDesc2 mat = makeDefaultDictMaterializer();
+    ZL_MaterializerDesc2 mat = makeDefaultDictMaterializer2();
     const ZL_Dict* found     = CDictMgr_findDict(&mgr_, &id, &mat);
     ASSERT_NE(found, nullptr);
     EXPECT_EQ(found->materializingCodec, 42u);
@@ -120,7 +118,7 @@ TEST_F(CDictMgrTest, LoadSingleDict)
 
 TEST_F(CDictMgrTest, LoadDictDuplicate)
 {
-    auto dict = buildPackedDict(16, makeDictID(7), 99, 0xAB, trt_custom);
+    auto dict = buildPackedDict(16, makeDictID(7), 99, 0xAB, true);
 
     auto r1 = CDictMgr_loadDict(&mgr_, dict.data(), dict.size());
     ASSERT_FALSE(ZL_RES_isError(r1));
@@ -128,7 +126,7 @@ TEST_F(CDictMgrTest, LoadDictDuplicate)
     ASSERT_FALSE(ZL_RES_isError(r2));
 
     ZL_DictID id             = makeDictID(7);
-    ZL_MaterializerDesc2 mat = makeDefaultDictMaterializer();
+    ZL_MaterializerDesc2 mat = makeDefaultDictMaterializer2();
     EXPECT_NE(CDictMgr_findDict(&mgr_, &id, &mat), nullptr);
 }
 
@@ -142,7 +140,7 @@ TEST_F(CDictMgrTest, FindDictNotLoaded)
 
 TEST_F(CDictMgrTest, DictDeduplicationViaLoadDict)
 {
-    auto dict1 = buildPackedDict(10, makeDictID(1), 100, 0xAA, trt_custom);
+    auto dict1 = buildPackedDict(10, makeDictID(1), 100, 0xAA, true);
 
     // Load same dict twice — second load should return the cached copy.
     auto r1 = CDictMgr_loadDict(&mgr_, dict1.data(), dict1.size());
@@ -164,7 +162,7 @@ TEST(CDictMgrStandaloneTest, DifferentMaterializerYieldsDifferentEntry)
 {
     // Set up mock nodes with dictID(1) and the default materializer.
     MockNodesMgr mockNodes;
-    ZL_MaterializerDesc2 matA = makeDefaultDictMaterializer();
+    ZL_MaterializerDesc2 matA = makeDefaultDictMaterializer2();
     mockNodes.addDictNode(makeDictID(1), matA, true /* standard node */);
 
     CDictMgr mgr{};
@@ -172,9 +170,8 @@ TEST(CDictMgrStandaloneTest, DifferentMaterializerYieldsDifferentEntry)
             &mgr, mockNodes.nodesManager(), NULL, mockNodes.opCtx());
     ASSERT_FALSE(ZL_isError(r));
 
-    auto customDict = buildPackedDict(10, makeDictID(1), 100, 0xAA, trt_custom);
-    auto standardDict =
-            buildPackedDict(10, makeDictID(1), 100, 0xAA, trt_standard);
+    auto customDict   = buildPackedDict(10, makeDictID(1), 100, 0xAA, true);
+    auto standardDict = buildPackedDict(10, makeDictID(1), 100, 0xAA, false);
 
     // Load the dict — no matching custom CNode.
     auto lr = CDictMgr_loadDict(&mgr, customDict.data(), customDict.size());
@@ -214,7 +211,7 @@ TEST_F(CDictMgrTest, GetBundleID)
     // No bundle ID before loading a bundle
     EXPECT_EQ(CDictMgr_getBundleID(&mgr_), nullptr);
 
-    auto dict   = buildPackedDict(10, makeDictID(1), 100, 0xAB, trt_custom);
+    auto dict   = buildPackedDict(10, makeDictID(1), 100, 0xAB, true);
     auto fatBuf = packFatBundle({ dict });
 
     auto r = CDictMgr_loadFatBundle(&mgr_, fatBuf.data(), fatBuf.size());

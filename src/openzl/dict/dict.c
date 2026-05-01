@@ -5,9 +5,10 @@
 #include <stdint.h>
 #include <string.h>
 
-#include "openzl/common/unique_id.h"
+#include "openzl/common/assertion.h"
 #include "openzl/dict/dict_constants.h"
 #include "openzl/fse/common/mem.h"
+#include "openzl/zl_unique_id.h"
 
 ZL_DictID Dict_extractID(const void* dictBuffer, size_t dictSize)
 {
@@ -18,7 +19,8 @@ ZL_DictID Dict_extractID(const void* dictBuffer, size_t dictSize)
     return dictID;
 }
 
-ZL_RESULT_OF(ZL_ParsedDict) Dict_parse(const void* dictBuffer, size_t dictSize)
+ZL_RESULT_OF(ZL_ParsedDict)
+ZL_Dict_parse(const void* dictBuffer, size_t dictSize)
 {
     ZL_RESULT_DECLARE_SCOPE(ZL_ParsedDict, NULL);
     ZL_ERR_IF_NULL(dictBuffer, dict_corruption, "dict buffer must not be null");
@@ -43,7 +45,7 @@ ZL_RESULT_OF(ZL_ParsedDict) Dict_parse(const void* dictBuffer, size_t dictSize)
     result.materializingCodec = (ZL_IDType)MEM_readLE32(p);
     p += 4;
 
-    result.codecType = (TransformType_e)(*p);
+    result.isCustomCodec = (*p != 0);
     p += 1;
 
     U32 const contentSize = MEM_readLE32(p);
@@ -68,7 +70,7 @@ ZL_Report Dict_pack(
         size_t dstCapacity,
         ZL_DictID dictID,
         ZL_IDType materializingCodec,
-        TransformType_e codecType,
+        bool isCustomCodec,
         const void* dictContent,
         size_t contentSize)
 {
@@ -96,7 +98,7 @@ ZL_Report Dict_pack(
     MEM_writeLE32(p, (U32)materializingCodec);
     p += 4;
 
-    *p = (unsigned char)codecType;
+    *p = (unsigned char)isCustomCodec;
     p += 1;
 
     MEM_writeLE32(p, (U32)contentSize);

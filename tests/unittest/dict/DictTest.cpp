@@ -6,9 +6,9 @@
 #include <numeric>
 #include <vector>
 
-#include "openzl/common/unique_id.h"
 #include "openzl/dict/dict.h"
 #include "openzl/fse/common/mem.h"
+#include "openzl/zl_unique_id.h"
 
 #include "DictTestHelpers.h"
 
@@ -25,7 +25,7 @@ TEST(DictTest, PackDstTooSmall)
             dst.size(),
             makeNullDictID(),
             0,
-            trt_standard,
+            false,
             content.data(),
             contentSize);
     EXPECT_EQ(ZL_errorCode(r), ZL_ErrorCode_dstCapacity_tooSmall);
@@ -33,7 +33,7 @@ TEST(DictTest, PackDstTooSmall)
 
 TEST(DictTest, ParseNullBuffer)
 {
-    auto result = Dict_parse(nullptr, 100);
+    auto result = ZL_Dict_parse(nullptr, 100);
     ASSERT_TRUE(ZL_RES_isError(result));
     EXPECT_EQ(ZL_RES_code(result), ZL_ErrorCode_dict_corruption);
 }
@@ -43,7 +43,7 @@ TEST(DictTest, ParseBufferOneByteTooSmall)
     std::vector<uint8_t> buf(ZL_DICT_HEADER_SIZE - 1, 0);
     MEM_writeLE32(buf.data(), ZL_DICT_MAGIC);
 
-    auto result = Dict_parse(buf.data(), buf.size());
+    auto result = ZL_Dict_parse(buf.data(), buf.size());
     ASSERT_TRUE(ZL_RES_isError(result));
     EXPECT_EQ(ZL_RES_code(result), ZL_ErrorCode_dict_corruption);
 }
@@ -53,7 +53,7 @@ TEST(DictTest, ParseWrongMagic)
     auto buf = buildPackedDict(0);
     MEM_writeLE32(buf.data(), 0xDEADBEEF);
 
-    auto result = Dict_parse(buf.data(), buf.size());
+    auto result = ZL_Dict_parse(buf.data(), buf.size());
     ASSERT_TRUE(ZL_RES_isError(result));
     EXPECT_EQ(ZL_RES_code(result), ZL_ErrorCode_dict_corruption);
 }
@@ -63,7 +63,7 @@ TEST(DictTest, ParseContentTruncatedByOneByte)
     auto buf = buildPackedDict(10);
     buf.resize(buf.size() - 1);
 
-    auto result = Dict_parse(buf.data(), buf.size());
+    auto result = ZL_Dict_parse(buf.data(), buf.size());
     ASSERT_TRUE(ZL_RES_isError(result));
     EXPECT_EQ(ZL_RES_code(result), ZL_ErrorCode_dict_corruption);
 }
@@ -75,13 +75,7 @@ TEST(DictTest, PackEmptyContent)
     std::vector<uint8_t> dst(ZL_DICT_HEADER_SIZE);
     uint8_t dummy = 0;
     ZL_Report r   = Dict_pack(
-            dst.data(),
-            dst.size(),
-            makeNullDictID(),
-            0,
-            trt_standard,
-            &dummy,
-            0);
+            dst.data(), dst.size(), makeNullDictID(), 0, false, &dummy, 0);
     ASSERT_FALSE(ZL_isError(r));
     EXPECT_EQ(ZL_validResult(r), ZL_DICT_HEADER_SIZE);
 }
@@ -97,7 +91,7 @@ TEST(DictTest, PackExactSizeBuffer)
             dst.size(),
             makeNullDictID(),
             0,
-            trt_standard,
+            false,
             content.data(),
             contentSize);
     ASSERT_FALSE(ZL_isError(r));
@@ -116,12 +110,12 @@ TEST(DictTest, PackNullIDAutoGeneratesFromContent)
             dst.size(),
             makeNullDictID(),
             0,
-            trt_standard,
+            false,
             content.data(),
             contentSize);
     ASSERT_FALSE(ZL_isError(r));
 
-    auto parseResult = Dict_parse(dst.data(), ZL_validResult(r));
+    auto parseResult = ZL_Dict_parse(dst.data(), ZL_validResult(r));
     ASSERT_FALSE(ZL_RES_isError(parseResult));
     auto parsed = ZL_RES_value(parseResult);
 
@@ -133,7 +127,7 @@ TEST(DictTest, PackNullIDAutoGeneratesFromContent)
 TEST(DictTest, ParseEmptyContent)
 {
     auto buf    = buildPackedDict(0);
-    auto result = Dict_parse(buf.data(), buf.size());
+    auto result = ZL_Dict_parse(buf.data(), buf.size());
     ASSERT_FALSE(ZL_RES_isError(result));
     auto parsed = ZL_RES_value(result);
 
@@ -146,7 +140,7 @@ TEST(DictTest, ParsePackedSizeEqualsHeaderPlusContent)
 {
     for (size_t sz : { 1, 7, 64, 255, 1024, 4096 }) {
         auto buf    = buildPackedDict(sz);
-        auto result = Dict_parse(buf.data(), buf.size());
+        auto result = ZL_Dict_parse(buf.data(), buf.size());
         ASSERT_FALSE(ZL_RES_isError(result)) << "contentSize=" << sz;
         EXPECT_EQ(ZL_RES_value(result).packedSize, ZL_DICT_HEADER_SIZE + sz)
                 << "contentSize=" << sz;
@@ -159,7 +153,7 @@ TEST(DictTest, ParseOversizedBufferSucceeds)
     auto buf                     = buildPackedDict(contentSize);
     buf.resize(buf.size() + 100, 0xFF);
 
-    auto result = Dict_parse(buf.data(), buf.size());
+    auto result = ZL_Dict_parse(buf.data(), buf.size());
     ASSERT_FALSE(ZL_RES_isError(result));
     auto parsed = ZL_RES_value(result);
     EXPECT_EQ(parsed.contentSize, contentSize);
@@ -180,14 +174,14 @@ TEST(DictTest, RoundtripAllFieldsPreserved)
             dst.size(),
             id,
             codec,
-            trt_custom,
+            true,
             content.data(),
             contentSize);
     ASSERT_FALSE(ZL_isError(r));
     size_t packedBytes = ZL_validResult(r);
     EXPECT_EQ(packedBytes, ZL_DICT_HEADER_SIZE + contentSize);
 
-    auto parseResult = Dict_parse(dst.data(), packedBytes);
+    auto parseResult = ZL_Dict_parse(dst.data(), packedBytes);
     ASSERT_FALSE(ZL_RES_isError(parseResult));
     auto parsed = ZL_RES_value(parseResult);
 
@@ -195,7 +189,7 @@ TEST(DictTest, RoundtripAllFieldsPreserved)
         EXPECT_EQ(parsed.dictID.id.bytes[i], id.id.bytes[i]) << "i=" << i;
     }
     EXPECT_EQ(parsed.materializingCodec, codec);
-    EXPECT_EQ(parsed.codecType, trt_custom);
+    EXPECT_TRUE(parsed.isCustomCodec);
     EXPECT_EQ(parsed.contentSize, contentSize);
     EXPECT_EQ(parsed.packedSize, packedBytes);
     EXPECT_EQ(std::memcmp(parsed.dictContent, content.data(), contentSize), 0);
