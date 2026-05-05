@@ -1,5 +1,6 @@
 #include <set>
 
+#include "openzl/compress/cgraph.h"
 #include "openzl/zl_reflection.h"
 #include "tools/logger/Logger.h"
 #include "tools/training/ace/ace_combination.h"
@@ -37,21 +38,17 @@ std::shared_ptr<const std::string_view> runReplacements(
     }
 
     // Replace each backend graph with the new GraphID
-    std::string serializedForReplacements = compressor.serialize();
     for (const auto& [backendGraph, newGraphId] : newGraphIds) {
-        auto result = replaceBaseGraphInCompressor(
-                serializedForReplacements,
-                backendGraph,
-                ZL_Compressor_Graph_getName(compressor.get(), newGraphId));
-
-        serializedForReplacements = std::string(result.begin(), result.end());
+        auto backendGraphId = compressor.getGraph(backendGraph);
+        compressor.unwrap(ZL_Compressor_overrideBaseGraph(
+                compressor.get(), backendGraphId.value(), newGraphId));
     }
 
-    auto json = Compressor::convertSerializedToJson(serializedForReplacements);
+    auto serialized = compressor.serialize();
+    auto json       = Compressor::convertSerializedToJson(serialized);
     Logger::log(VERBOSE3, "Graph with trained ACE successors: ", json);
 
-    return graph_mutation::createSharedStringView(
-            std::move(serializedForReplacements));
+    return graph_mutation::createSharedStringView(std::move(serialized));
 }
 
 /**
@@ -282,10 +279,16 @@ std::vector<std::shared_ptr<const std::string_view>> getCombinedCompressors(
     auto compressor = makeCompressor();
     auto cctx       = refCCtxForTraining(compressor);
     auto serialized = compressor.serialize();
-    /// Get the ACECompressor for each backend graph from the
-    /// trainedSerializedCompressor
-    const std::vector<std::string> autoBackendGraphs =
-            findAllGraphsWithPrefix(serialized, ACE_GRAPH_NAME);
+
+    /// Get the ACECompressor for each backend graph from the compressor
+    const std::vector<GraphID> autoBackendGraphIDs =
+            findAllGraphsWithPrefix(compressor, ACE_GRAPH_NAME);
+    std::vector<std::string> autoBackendGraphs;
+    autoBackendGraphs.reserve(autoBackendGraphIDs.size());
+    for (const auto& graphID : autoBackendGraphIDs) {
+        autoBackendGraphs.emplace_back(
+                ZL_Compressor_Graph_getName(compressor.get(), graphID));
+    }
 
     // Note this is done a second time (is it worth caching the flattened
     // samples)
