@@ -519,7 +519,7 @@ TEST_F(SemanticAnalyzerTest, InstantParseSimple)
         }
     )";
     auto ast        = compiler_->compile_ast(prog, "[local_input]");
-    EXPECT_FALSE(find_record(ast, "Foo")->annotations().requires_scan);
+    EXPECT_FALSE(find_record(ast, "Foo")->inferred_annotations().requires_scan);
 }
 
 TEST_F(SemanticAnalyzerTest, InstantParseWithParam)
@@ -530,7 +530,7 @@ TEST_F(SemanticAnalyzerTest, InstantParseWithParam)
         }
     )";
     auto ast        = compiler_->compile_ast(prog, "[local_input]");
-    EXPECT_FALSE(find_record(ast, "Foo")->annotations().requires_scan);
+    EXPECT_FALSE(find_record(ast, "Foo")->inferred_annotations().requires_scan);
 }
 
 TEST_F(SemanticAnalyzerTest, ScanSimple)
@@ -542,7 +542,7 @@ TEST_F(SemanticAnalyzerTest, ScanSimple)
         }
     )";
     auto ast        = compiler_->compile_ast(prog, "[local_input]");
-    EXPECT_TRUE(find_record(ast, "Foo")->annotations().requires_scan);
+    EXPECT_TRUE(find_record(ast, "Foo")->inferred_annotations().requires_scan);
 }
 
 TEST_F(SemanticAnalyzerTest, RequiresScanConditional)
@@ -556,7 +556,7 @@ TEST_F(SemanticAnalyzerTest, RequiresScanConditional)
         }
     )";
     auto ast        = compiler_->compile_ast(prog, "[local_input]");
-    EXPECT_TRUE(find_record(ast, "Foo")->annotations().requires_scan);
+    EXPECT_TRUE(find_record(ast, "Foo")->inferred_annotations().requires_scan);
 }
 
 TEST_F(SemanticAnalyzerTest, RequiresScanNested)
@@ -571,8 +571,10 @@ TEST_F(SemanticAnalyzerTest, RequiresScanNested)
         }
     )";
     auto ast        = compiler_->compile_ast(prog, "[local_input]");
-    EXPECT_TRUE(find_record(ast, "Inner")->annotations().requires_scan);
-    EXPECT_TRUE(find_record(ast, "Outer")->annotations().requires_scan);
+    EXPECT_TRUE(
+            find_record(ast, "Inner")->inferred_annotations().requires_scan);
+    EXPECT_TRUE(
+            find_record(ast, "Outer")->inferred_annotations().requires_scan);
 }
 
 TEST_F(SemanticAnalyzerTest, RequiresScanNestedConditional)
@@ -590,8 +592,10 @@ TEST_F(SemanticAnalyzerTest, RequiresScanNestedConditional)
         flags: UInt8
     )";
     auto ast        = compiler_->compile_ast(prog, "[local_input]");
-    EXPECT_TRUE(find_record(ast, "Inner")->annotations().requires_scan);
-    EXPECT_TRUE(find_record(ast, "Outer")->annotations().requires_scan);
+    EXPECT_TRUE(
+            find_record(ast, "Inner")->inferred_annotations().requires_scan);
+    EXPECT_TRUE(
+            find_record(ast, "Outer")->inferred_annotations().requires_scan);
 }
 
 TEST_F(SemanticAnalyzerTest, RequiresScanOuter)
@@ -607,8 +611,10 @@ TEST_F(SemanticAnalyzerTest, RequiresScanOuter)
         }
     )";
     auto ast        = compiler_->compile_ast(prog, "[local_input]");
-    EXPECT_TRUE(find_record(ast, "Outer")->annotations().requires_scan);
-    EXPECT_FALSE(find_record(ast, "Inner")->annotations().requires_scan);
+    EXPECT_TRUE(
+            find_record(ast, "Outer")->inferred_annotations().requires_scan);
+    EXPECT_FALSE(
+            find_record(ast, "Inner")->inferred_annotations().requires_scan);
 }
 
 TEST_F(SemanticAnalyzerTest, TypeCheckReferencedFields)
@@ -626,5 +632,43 @@ TEST_F(SemanticAnalyzerTest, TypeCheckReferencedFields)
         }
     )";
     expect_error(prog, "numeric");
+}
+
+// ---------------------------------------------------------------------------
+// Grammar annotations (@name)
+// ---------------------------------------------------------------------------
+
+TEST_F(SemanticAnalyzerTest, GrammarAnnotationAttached)
+{
+    const auto prog = R"(
+        record Foo() {
+            x: Int32LE
+        } @some_annotation
+    )";
+    auto ast        = compiler_->compile_ast(prog, "[local_input]");
+    const auto* foo = find_record(ast, "Foo");
+    EXPECT_TRUE(foo->annotations().has("some_annotation"));
+}
+
+TEST_F(SemanticAnalyzerTest, MultipleGrammarAnnotationsOnOneRecord)
+{
+    const auto prog = R"(
+        record Foo() {
+            x: Int32LE
+        } @first @second
+    )";
+    auto ast        = compiler_->compile_ast(prog, "[local_input]");
+    const auto* foo = find_record(ast, "Foo");
+    EXPECT_TRUE(foo->annotations().has("first"));
+    EXPECT_TRUE(foo->annotations().has("second"));
+}
+
+TEST_F(SemanticAnalyzerTest, GrammarAnnotationOnAnonymousRecord)
+{
+    const auto prog = R"(
+        entry: record() { id: Int32LE } @some_annotation
+        expect entry.id == 0
+    )";
+    expect_success(prog);
 }
 } // namespace openzl::sddl2::tests
