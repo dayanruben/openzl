@@ -45,6 +45,10 @@ const ZL_SegmenterDesc* CGRAPH_getSegmenterDesc(
         const ZL_Compressor* compressor,
         ZL_GraphID graphid);
 
+const void* CGRAPH_getGraphMParamObj(
+        const ZL_Compressor* compressor,
+        ZL_GraphID graphid);
+
 const void* CGRAPH_graphPrivateParam(
         const ZL_Compressor* cgraph,
         ZL_GraphID graphid);
@@ -156,7 +160,7 @@ ZL_Report ZL_Compressor_overrideNodeParams(
 const ZL_Dict* CGRAPH_findDict(
         const ZL_Compressor* cgraph,
         const ZL_DictID* id,
-        const ZL_MaterializerDesc2* matDesc);
+        const ZL_MaterializerDesc* matDesc);
 
 ZL_END_C_DECLS
 
