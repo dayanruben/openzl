@@ -23,7 +23,15 @@
 const ZL_PivCoHuffmanEncode* ZL_PivCoHuffmanEncode_select(
         const ZL_cpuid_t* cpuid)
 {
-    (void)cpuid;
+    ZL_cpuid_t localCpuid;
+    if (cpuid == NULL) {
+        localCpuid = ZL_cpuid();
+        cpuid      = &localCpuid;
+    }
+
+    if (ZL_PivCoHuffmanEncode_avx512.supported(cpuid)) {
+        return &ZL_PivCoHuffmanEncode_avx512;
+    }
     return &ZL_PivCoHuffmanEncode_generic;
 }
 
@@ -74,16 +82,6 @@ static size_t partitionGeneric(
     }
     (void)ZS_BitCStreamFF_finish(&out);
     return ones;
-}
-
-static size_t partitionLeft(
-        uint8_t* bitmap,
-        uint8_t* lhs,
-        const uint8_t* ranks,
-        size_t numRanks,
-        uint8_t rightRank)
-{
-    return partitionGeneric(bitmap, lhs, NULL, ranks, numRanks, rightRank);
 }
 
 static size_t partitionRight(
@@ -140,7 +138,6 @@ static bool supported(const ZL_cpuid_t* cpuid)
 const ZL_PivCoHuffmanEncode ZL_PivCoHuffmanEncode_generic = {
     .supported      = supported,
     .partitionFull  = partitionGeneric,
-    .partitionLeft  = partitionLeft,
     .partitionRight = partitionRight,
     .partitionNone  = partitionNone,
     .packFlatDepth  = packFlatDepth,

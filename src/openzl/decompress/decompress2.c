@@ -1772,27 +1772,36 @@ static void cleanAllBuffers(ZL_DCtx* dctx)
     cleanChunkBuffers(dctx);
 }
 
-// -------------------------------------
-// Main decompression functions
-// -------------------------------------
 /**
- * @return size of chunk, read from frame
+ * Populates @p dctx to prepare for decoding the chunk beginning at @p
+ * alreadyConsumed in
+ * @p framePtr.
+ *
+ * Clears chunk-scoped buffers, decodes the chunk header and stored streams,
+ * reads the optional content checksum into @p expectedContentHash, and
+ * validates the optional compressed checksum before decoders run.
+ *
+ * @param dctx Decompression context to populate for the chunk.
+ * @param framePtr Beginning of the frame buffer.
+ * @param frameSize Size of @p framePtr in bytes.
+ * @param alreadyConsumed Number of frame bytes consumed before this chunk.
+ * @param expectedContentHash Output content checksum, or 0 when absent.
+ * @return DCTX_FrameChunkInfo metadata for the prepared chunk.
  */
-static ZL_Report ZL_DCtx_decompressChunk(
+static ZL_RESULT_OF(DCTX_FrameChunkInfo) setupChunkDecode(
         ZL_DCtx* dctx,
-        size_t nbOutputs,
         const void* framePtr,
         size_t frameSize,
-        size_t alreadyConsumed)
+        size_t alreadyConsumed,
+        uint32_t* expectedContentHash)
 {
-    ZL_RESULT_DECLARE_SCOPE_REPORT(dctx);
+    ZL_RESULT_DECLARE_SCOPE(DCTX_FrameChunkInfo, dctx);
     size_t consumedSize = alreadyConsumed;
     ZL_DLOG(BLOCK,
-            "ZL_DCtx_decompressChunk (frameSize=%zu, consumedSize=%zu)",
+            "setupChunkDecode (frameSize=%zu, consumedSize=%zu)",
             frameSize,
             consumedSize);
     ZL_ASSERT_NN(dctx);
-    ZL_Data** outputs = dctx->outputs;
 
     // We clean at the beginning instead of the end
     // in case `DCTX_preserveStreams` is set,
@@ -1818,12 +1827,13 @@ static ZL_Report ZL_DCtx_decompressChunk(
     // If present, verify the compressed checksum before running decoders.
     // Assuming we aren't handling malicious inputs, this ensures that we
     // are running on valid data before we run the decoders.
-    uint32_t expectedContentHash = 0;
+    *expectedContentHash = 0;
 
     if (FrameInfo_hasContentChecksum(dctx->dfh.frameinfo)) {
         ZL_ERR_IF_LT(frameSize, consumedSize + 4, srcSize_tooSmall);
-        expectedContentHash = ZL_readCE32((const char*)framePtr + consumedSize);
-        ZL_DLOG(SEQ, "stored contentHash: %08X", expectedContentHash);
+        *expectedContentHash =
+                ZL_readCE32((const char*)framePtr + consumedSize);
+        ZL_DLOG(SEQ, "stored contentHash: %08X", *expectedContentHash);
         consumedSize += 4;
     }
 
@@ -1861,6 +1871,96 @@ static ZL_Report ZL_DCtx_decompressChunk(
 #endif
         consumedSize += 4;
     }
+
+    DCTX_FrameChunkInfo const chunkInfo = {
+        .chunkHeaderSize = chunkHeaderSize,
+        .chunkSize       = consumedSize - alreadyConsumed,
+    };
+    return ZL_WRAP_VALUE(chunkInfo);
+}
+
+ZL_RESULT_OF(DCTX_FrameChunkInfo)
+DCTX_prepareFrameChunk(
+        ZL_DCtx* dctx,
+        const void* framePtr,
+        size_t frameSize,
+        size_t chunkOffset)
+{
+    ZL_RESULT_DECLARE_SCOPE(DCTX_FrameChunkInfo, dctx);
+    ZL_ASSERT_NN(dctx);
+
+    // Parse-only setup has no output buffers. Temporarily hide final outputs
+    // so fillStoredStreams skips output-backed append optimizations.
+    size_t const nbOutputs = dctx->nbOutputs;
+    dctx->nbOutputs        = 0;
+
+    uint32_t dummyHash = 0;
+    ZL_RESULT_OF(DCTX_FrameChunkInfo)
+    const chunkResult = setupChunkDecode(
+            dctx, framePtr, frameSize, chunkOffset, &dummyHash);
+
+    dctx->nbOutputs = nbOutputs;
+    ZL_ERR_IF_ERR(chunkResult);
+    return chunkResult;
+}
+
+ZL_Report DCTX_prepareFrameChunkFromHeader(
+        ZL_DCtx* dctx,
+        const void* chunkHeader,
+        size_t chunkHeaderSize,
+        const void* chunkRef,
+        size_t chunkSize)
+{
+    ZL_RESULT_DECLARE_SCOPE_REPORT(dctx);
+    ZL_ASSERT_NN(dctx);
+    ZL_ASSERT_NN(chunkHeader);
+    ZL_ASSERT_NN(chunkRef);
+
+    // We clean at the beginning instead of the end
+    // in case `DCTX_preserveStreams` is set,
+    // requiring to preserve some results for StreamDump2
+    cleanChunkBuffers(dctx);
+
+    ZL_TRY_LET(
+            size_t,
+            decodedChunkHeaderSize,
+            DFH_decodeChunkHeader(&dctx->dfh, chunkHeader, chunkHeaderSize));
+
+    size_t const nbOutputs        = dctx->nbOutputs;
+    dctx->nbOutputs               = 0;
+    ZL_Report const streamsResult = fillStoredStreams(
+            dctx, chunkRef, chunkSize, decodedChunkHeaderSize);
+
+    dctx->nbOutputs = nbOutputs;
+    ZL_ERR_IF_ERR(streamsResult);
+    return ZL_returnSuccess();
+}
+// -------------------------------------
+// Main decompression functions
+// -------------------------------------
+/**
+ * @return size of chunk, read from frame
+ */
+static ZL_Report ZL_DCtx_decompressChunk(
+        ZL_DCtx* dctx,
+        size_t nbOutputs,
+        const void* framePtr,
+        size_t frameSize,
+        size_t alreadyConsumed)
+{
+    ZL_RESULT_DECLARE_SCOPE_REPORT(dctx);
+    ZL_Data** outputs            = dctx->outputs;
+    uint32_t expectedContentHash = 0;
+    ZL_TRY_LET(
+            DCTX_FrameChunkInfo,
+            chunkInfo,
+            setupChunkDecode(
+                    dctx,
+                    framePtr,
+                    frameSize,
+                    alreadyConsumed,
+                    &expectedContentHash));
+    size_t const chunkSize = chunkInfo.chunkSize;
 
     // start the decompression process.
     ZL_ERR_IF_ERR(runDecoders(dctx));
@@ -1913,8 +2013,7 @@ static ZL_Report ZL_DCtx_decompressChunk(
 #endif
     }
 
-    ZL_ASSERT_GE(consumedSize, alreadyConsumed);
-    return ZL_returnValue(consumedSize - alreadyConsumed);
+    return ZL_returnValue(chunkSize);
 }
 
 ZL_Report ZL_DCtx_decompressMultiTBuffer(
@@ -2333,4 +2432,15 @@ ZL_Report ZL_DCtx_detachAllDecompressIntrospectionHooks(ZL_DCtx* dctx)
             sizeof(oc->decompressIntrospectionHooks));
     oc->hasDecompressionHooks = false;
     return ZL_returnSuccess();
+}
+
+ZL_Report DCTX_initFromFrameInfo(ZL_DCtx* dctx, const ZL_FrameInfo* frameInfo)
+{
+    ZL_RESULT_DECLARE_SCOPE_REPORT(dctx);
+    ZL_ASSERT_NN(dctx);
+    ZL_TRY_LET(size_t, nbOutputs, ZL_FrameInfo_getNumOutputs(frameInfo));
+    ZL_ERR_IF_ERR(DFH_setFrameInfo(
+            &dctx->dfh, frameInfo, ZL_DCtx_getOperationContext(dctx)));
+    dctx->nbOutputs = nbOutputs;
+    return DCtx_setAppliedParameters(dctx);
 }
