@@ -7,7 +7,8 @@
 
 #include <cuda_runtime.h>
 
-#include "openzl/dev/contrib/gpu/source/common/cuda_raii.cuh"
+#include "contrib/gpu/src/common/cuda_launch.cuh"
+#include "contrib/gpu/src/common/segment_plan.cuh"
 
 namespace openzl::gpu {
 
@@ -20,6 +21,20 @@ struct FloatDeconChunk {
     const uint8_t* signFrac;
     uint16_t* dst;
     size_t nbElts;
+
+    // Peels the first min(n, nbElts) elements off as a new segment and advances
+    // *this past them, advancing device pointers only (no data copy).
+    FloatDeconChunk peel(size_t n)
+    {
+        n                   = n < nbElts ? n : nbElts;
+        FloatDeconChunk seg = *this;
+        seg.nbElts          = n;
+        exponent += n;
+        signFrac += n;
+        dst += n;
+        nbElts -= n;
+        return seg;
+    }
 };
 
 // Canonical single element decode
@@ -46,11 +61,8 @@ void bf16DeconDecode(
         cudaStream_t stream);
 
 // Occupancy/launch metadata for the main decode kernel, so a benchmark harness
-// can report theoretical occupancy without seeing the kernel internals
-struct KernelLaunchInfo {
-    int blockSize;
-    int maxActiveBlocksPerSM;
-};
+// can report theoretical occupancy without seeing the kernel internals.
+// KernelLaunchInfo is the shared descriptor from common/cuda_launch.cuh.
 KernelLaunchInfo bf16DeconDecodeLaunchInfo();
 
 // v2 decode: tiled and load-balanced across chunks (fixes the jagged case).
@@ -105,12 +117,11 @@ class UnifiedDecodePlan {
 
     uint32_t numSegments() const
     {
-        return numSegs_;
+        return plan_.numSegs();
     }
 
    private:
-    DevicePtr<FloatDeconChunk> segs_d_;
-    uint32_t numSegs_ = 0;
+    SegmentPlan<FloatDeconChunk> plan_;
 };
 
 // One-shot convenience: prepare a UnifiedDecodePlan and launch it on `stream`.

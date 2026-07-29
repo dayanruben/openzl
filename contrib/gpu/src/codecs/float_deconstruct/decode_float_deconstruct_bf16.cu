@@ -4,12 +4,14 @@
 
 #include <algorithm>
 #include <cassert>
-#include <limits>
 #include <stdexcept>
 #include <string>
 #include <vector>
 
-#include "openzl/dev/contrib/gpu/source/common/cuda_error.cuh"
+#include "contrib/gpu/src/common/cuda_error.cuh"
+#include "contrib/gpu/src/common/cuda_launch.cuh"
+#include "contrib/gpu/src/common/cuda_raii.cuh"
+#include "contrib/gpu/src/common/segment_plan.cuh"
 
 namespace openzl::gpu {
 
@@ -199,90 +201,6 @@ __global__ void decodeSegmentsKernel(
     }
 }
 
-// 1D grid size that fills the GPU for a given kernel at kThreads.
-uint32_t fillGpuGrid(const void* kernel)
-{
-    int maxBlocksPerSM = 0;
-    ZL_CUDA_CHECK(cudaOccupancyMaxActiveBlocksPerMultiprocessor(
-            &maxBlocksPerSM, kernel, kThreads, 0));
-    int dev    = 0;
-    int numSMs = 0;
-    ZL_CUDA_CHECK(cudaGetDevice(&dev));
-    ZL_CUDA_CHECK(cudaDeviceGetAttribute(
-            &numSMs, cudaDevAttrMultiProcessorCount, dev));
-    const uint32_t grid = (uint32_t)maxBlocksPerSM * (uint32_t)numSMs;
-    return grid == 0 ? 1 : grid;
-}
-
-// Host-side. Peels the first min(n, c.nbElts) elements off c as a new segment
-// and advances c past them. Only advances device pointers, so the segment
-// aliases the original device buffers, no data is copied.
-FloatDeconChunk peel(FloatDeconChunk& c, size_t n)
-{
-    n                   = std::min(n, c.nbElts);
-    FloatDeconChunk seg = c;
-    seg.nbElts          = n;
-    c.exponent += n;
-    c.signFrac += n;
-    c.dst += n;
-    c.nbElts -= n;
-    return seg;
-}
-
-// Host-side. Splits each chunk into segments of at most maxSegElts, so all
-// segments carry roughly equal work regardless of the input shape.
-std::vector<FloatDeconChunk>
-rechunk(const FloatDeconChunk* chunks_h, uint32_t numInBatch, size_t maxSegElts)
-{
-    size_t numSegs = 0;
-    for (uint32_t c = 0; c < numInBatch; ++c) {
-        const size_t nb = chunks_h[c].nbElts;
-        numSegs += (nb + maxSegElts - 1) / maxSegElts;
-    }
-    if (numSegs > std::numeric_limits<uint32_t>::max()) {
-        throw std::runtime_error(
-                "bf16 unified decode: segment count " + std::to_string(numSegs)
-                + " exceeds uint32_t limit; use a larger maxSegElts");
-    }
-    std::vector<FloatDeconChunk> out;
-    out.reserve(numSegs);
-    for (uint32_t c = 0; c < numInBatch; ++c) {
-        FloatDeconChunk cur = chunks_h[c];
-        while (cur.nbElts > 0) {
-            out.push_back(peel(cur, maxSegElts));
-        }
-    }
-    return out;
-}
-
-// Stream-ordered device scratch: frees on the same stream at scope exit, so an
-// exception between allocation and launch cannot leak it.
-template <typename T>
-class StreamScratch {
-   public:
-    StreamScratch(size_t n, cudaStream_t stream) : stream_(stream)
-    {
-        ZL_CUDA_CHECK(cudaMallocAsync(&p_, n * sizeof(T), stream));
-    }
-    ~StreamScratch()
-    {
-        if (p_) {
-            cudaFreeAsync(p_, stream_);
-        }
-    }
-    StreamScratch(const StreamScratch&)            = delete;
-    StreamScratch& operator=(const StreamScratch&) = delete;
-
-    T* get() const
-    {
-        return p_;
-    }
-
-   private:
-    T* p_ = nullptr;
-    cudaStream_t stream_;
-};
-
 // Throws unless maxSegElts is a positive multiple of kVec (the alignment
 // invariant the vectorized loads/stores rely on).
 void validateMaxSegElts(size_t maxSegElts)
@@ -301,8 +219,9 @@ void launchSegments(
         uint32_t numSegs,
         cudaStream_t stream)
 {
-    const uint32_t target = fillGpuGrid((const void*)decodeSegmentsKernel);
-    const uint32_t grid   = (uint32_t)std::min<size_t>(numSegs, target);
+    const uint32_t target =
+            fillGpuGrid((const void*)decodeSegmentsKernel, kThreads);
+    const uint32_t grid = (uint32_t)std::min<size_t>(numSegs, target);
     decodeSegmentsKernel<<<grid, kThreads, 0, stream>>>(segs_d, numSegs);
     ZL_CUDA_CHECK_LAST();
 }
@@ -325,7 +244,8 @@ void bf16DeconDecode(
     }
     // Oversubscribe x so blocksPerChunk * numInBatch roughly fills the GPU;
     // grid-stride in x then covers any per-chunk size.
-    const uint32_t target = fillGpuGrid((const void*)decodeChunksKernel);
+    const uint32_t target =
+            fillGpuGrid((const void*)decodeChunksKernel, kThreads);
     const uint32_t blocksPerChunk = (target + numInBatch - 1) / numInBatch;
     const dim3 grid(blocksPerChunk, numInBatch);
     decodeChunksKernel<<<grid, kThreads, 0, stream>>>(chunks_d, numInBatch);
@@ -334,13 +254,7 @@ void bf16DeconDecode(
 
 KernelLaunchInfo bf16DeconDecodeLaunchInfo()
 {
-    int maxActiveBlocksPerSM = 0;
-    ZL_CUDA_CHECK(cudaOccupancyMaxActiveBlocksPerMultiprocessor(
-            &maxActiveBlocksPerSM,
-            (const void*)decodeChunksKernel,
-            kThreads,
-            0));
-    return { kThreads, maxActiveBlocksPerSM };
+    return launchInfoFor((const void*)decodeChunksKernel, kThreads);
 }
 
 void bf16DeconDecodeV2(
@@ -352,28 +266,20 @@ void bf16DeconDecodeV2(
         return;
     }
     // Stream-ordered scratch for the flat-space offsets prefix sum.
-    size_t* offsets = nullptr;
-    ZL_CUDA_CHECK(cudaMallocAsync(
-            &offsets, (size_t)(numInBatch + 1) * sizeof(size_t), stream));
-    computeOffsetsKernel<<<1, 1, 0, stream>>>(chunks_d, numInBatch, offsets);
+    StreamScratch<size_t> offsets(numInBatch + 1, stream);
+    computeOffsetsKernel<<<1, 1, 0, stream>>>(
+            chunks_d, numInBatch, offsets.get());
     ZL_CUDA_CHECK_LAST();
 
-    const uint32_t grid = fillGpuGrid((const void*)decodeTiledKernel);
+    const uint32_t grid = fillGpuGrid((const void*)decodeTiledKernel, kThreads);
     decodeTiledKernel<<<grid, kThreads, 0, stream>>>(
-            chunks_d, offsets, numInBatch);
+            chunks_d, offsets.get(), numInBatch);
     ZL_CUDA_CHECK_LAST();
-    ZL_CUDA_CHECK(cudaFreeAsync(offsets, stream));
 }
 
 KernelLaunchInfo bf16DeconDecodeV2LaunchInfo()
 {
-    int maxActiveBlocksPerSM = 0;
-    ZL_CUDA_CHECK(cudaOccupancyMaxActiveBlocksPerMultiprocessor(
-            &maxActiveBlocksPerSM,
-            (const void*)decodeTiledKernel,
-            kThreads,
-            0));
-    return { kThreads, maxActiveBlocksPerSM };
+    return launchInfoFor((const void*)decodeTiledKernel, kThreads);
 }
 
 void bf16DeconDecodeVec(
@@ -390,7 +296,8 @@ void bf16DeconDecodeVec(
                 + " exceeds kMaxNumInBatch " + std::to_string(kMaxNumInBatch)
                 + " (gridDim.y limit); split the batch across calls");
     }
-    const uint32_t target = fillGpuGrid((const void*)decodeChunksVecKernel);
+    const uint32_t target =
+            fillGpuGrid((const void*)decodeChunksVecKernel, kThreads);
     const uint32_t blocksPerChunk = (target + numInBatch - 1) / numInBatch;
     const dim3 grid(blocksPerChunk, numInBatch);
     decodeChunksVecKernel<<<grid, kThreads, 0, stream>>>(chunks_d, numInBatch);
@@ -399,50 +306,25 @@ void bf16DeconDecodeVec(
 
 KernelLaunchInfo bf16DeconDecodeVecLaunchInfo()
 {
-    int maxActiveBlocksPerSM = 0;
-    ZL_CUDA_CHECK(cudaOccupancyMaxActiveBlocksPerMultiprocessor(
-            &maxActiveBlocksPerSM,
-            (const void*)decodeChunksVecKernel,
-            kThreads,
-            0));
-    return { kThreads, maxActiveBlocksPerSM };
+    return launchInfoFor((const void*)decodeChunksVecKernel, kThreads);
 }
 
+// segAlignElts = kVec keeps every segment start aligned for the vectorized
+// loads/stores.
 UnifiedDecodePlan::UnifiedDecodePlan(
         const FloatDeconChunk* chunks_h,
         uint32_t numInBatch,
         size_t maxSegElts)
+        : plan_(chunks_h, numInBatch, maxSegElts, kVec)
 {
-    if (numInBatch == 0) {
-        return;
-    }
-    validateMaxSegElts(maxSegElts);
-
-    // Split on the host into equal-sized segments (device pointers advanced, no
-    // copy) and stage the segment descriptors once. Segment starts land at
-    // multiples of maxSegElts from cudaMalloc-aligned bases, so with maxSegElts
-    // % kVec == 0 every segment start is 4/8-aligned for the vectorized
-    // loads/stores.
-    const std::vector<FloatDeconChunk> segs =
-            rechunk(chunks_h, numInBatch, maxSegElts);
-    if (segs.empty()) {
-        return;
-    }
-    numSegs_ = (uint32_t)segs.size();
-    segs_d_  = deviceAlloc<FloatDeconChunk>(numSegs_);
-    ZL_CUDA_CHECK(cudaMemcpy(
-            segs_d_.get(),
-            segs.data(),
-            (size_t)numSegs_ * sizeof(FloatDeconChunk),
-            cudaMemcpyHostToDevice));
 }
 
 void UnifiedDecodePlan::launch(cudaStream_t stream) const
 {
-    if (numSegs_ == 0) {
+    if (plan_.numSegs() == 0) {
         return;
     }
-    launchSegments(segs_d_.get(), numSegs_, stream);
+    launchSegments(plan_.deviceSegments(), plan_.numSegs(), stream);
 }
 
 void bf16DeconDecodeUnified(
@@ -475,13 +357,7 @@ void bf16DeconDecodeUnified(
 
 KernelLaunchInfo bf16DeconDecodeUnifiedLaunchInfo()
 {
-    int maxActiveBlocksPerSM = 0;
-    ZL_CUDA_CHECK(cudaOccupancyMaxActiveBlocksPerMultiprocessor(
-            &maxActiveBlocksPerSM,
-            (const void*)decodeSegmentsKernel,
-            kThreads,
-            0));
-    return { kThreads, maxActiveBlocksPerSM };
+    return launchInfoFor((const void*)decodeSegmentsKernel, kThreads);
 }
 
 } // namespace openzl::gpu
