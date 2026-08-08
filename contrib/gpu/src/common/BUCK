@@ -45,3 +45,31 @@ cpp_library(
     ],
     exported_external_deps = [("cuda", None, "cuda-lazy")],
 )
+
+cpp_library(
+    name = "cuda_error_relative_headers",
+    headers = relative_headers(["cuda_error.cuh"]),
+    header_namespace = "",
+    exported_deps = [],
+    exported_external_deps = [("cuda", None, "cuda-lazy")],
+)
+
+cpp_library(
+    name = "cuda_raii_relative_headers",
+    headers = relative_headers(["cuda_raii.cuh"]),
+    header_namespace = "",
+    exported_deps = [
+        ":cuda_error_relative_headers",
+        ":cuda_raii",
+    ],
+    exported_external_deps = [("cuda", None, "cuda-lazy")],
+)
+
+# CPU metadata contract shared by codec planners and the decode scheduler.
+cpp_library(
+    # @autodeps-skip
+    name = "codec_decode_planning",
+    headers = relative_headers(["codec_decode_planning.hpp"]),
+    header_namespace = "",
+    exported_deps = ["../../../..:zstronglib"],
+)
