@@ -7,6 +7,7 @@
 
 #include "custom_parsers/dependency_registration.h"
 #include "openzl/cpp/Compressor.hpp"
+#include "openzl/zl_version.h"
 
 #include "tools/io/InputSetBuilder.h"
 #include "tools/io/OutputFile.h"
@@ -125,6 +126,13 @@ class TrainArgs : public GlobalArgs, public ProfileArgs {
                 0,
                 false,
                 "Save the ACE state as a local parameter in the trained compressor.");
+        parser.addCommandFlag(
+                cmd(),
+                kFormatVersion,
+                0,
+                true,
+                "Target format version for training. If not provided, defaults "
+                "to the maximum supported format version.");
     }
 
     explicit TrainArgs(const arg::ParsedArgs& parsed)
@@ -133,6 +141,14 @@ class TrainArgs : public GlobalArgs, public ProfileArgs {
         // Create the compressor
         setCompressor(createCompressorFromArgs(
                 *this, parsed.cmdFlag(cmd(), kCompressor)));
+        auto formatVersion = parsed.cmdFlag(cmd(), kFormatVersion);
+        if (formatVersion) {
+            compressor()->setParameter(
+                    CParam::FormatVersion,
+                    util::checkedstoi(formatVersion.value()));
+        } else {
+            applyDefaultFormatVersion();
+        }
         auto outputPath = parsed.cmdFlag(cmd(), kOutput);
         if (outputPath) {
             checkOutput(outputPath.value(), parsed.cmdHasFlag(cmd(), kForce));
@@ -228,6 +244,7 @@ class TrainArgs : public GlobalArgs, public ProfileArgs {
         // Inline training (e.g. `compress --train-inline`) produces a
         // standalone compressor only; dictionary training is opt-in via
         // --dict-bundle-output.
+        applyDefaultFormatVersion();
         trainParams.dictTraining = false;
         trainParams.compressorGenFunc =
                 custom_parsers::createCompressorFromSerialized;
@@ -246,6 +263,15 @@ class TrainArgs : public GlobalArgs, public ProfileArgs {
     training::TrainParams trainParams;
 
    private:
+    // The trained (and serialized) compressor must carry a format version so
+    // that downstream training can target it. Default to the maximum supported
+    // version when the compressor does not already specify one.
+    void applyDefaultFormatVersion()
+    {
+        compressor()->setParameter(
+                CParam::FormatVersion, ZL_MAX_FORMAT_VERSION);
+    }
+
     inline static const std::string kSampleDir  = "sample-dir";
     inline static const std::string kCompressor = "compressor";
 
@@ -265,6 +291,7 @@ class TrainArgs : public GlobalArgs, public ProfileArgs {
     inline static const std::string kMaxTotalSizeMb  = "max-total-size-mb";
     inline static const std::string kParetoFrontier  = "pareto-frontier";
     inline static const std::string kSaveAceState    = "save-ace-state";
+    inline static const std::string kFormatVersion   = "format-version";
 };
 
 } // namespace openzl::cli
