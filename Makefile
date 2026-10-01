@@ -57,41 +57,10 @@ LIBGTEST_A := deps/googletest/lib/libgtest.a
 LIBXGBOOST_A := deps/xgboost/lib/libxgboost.a
 LIBDMLC_A := deps/xgboost/lib/libdmlc.a
 
+ZSTD_HEADER := deps/zstd/lib/zstd.h
+LZ4_HEADER := deps/lz4/lib/lz4.h
 GTEST_HEADERS := deps/googletest/googletest/include/gtest/gtest.h
 XGBOOST_HEADER := deps/xgboost/include/xgboost/c_api.h
-
-ifndef SKIP_BUILDDEPS_CHECK
-  # Check if any gtest-dependent targets are being built
-  GTEST_TARGETS := gtests test all
-  BUILDING_GTEST_TARGETS := $(filter $(GTEST_TARGETS),$(MAKECMDGOALS))
-  # Only build gtest deps if we're actually building gtest targets
-  ifneq ($(BUILDING_GTEST_TARGETS),)
-    ifeq ($(wildcard $(GTEST_HEADERS)),)
-      $(info Downloading gtest dependency for targets: $(BUILDING_GTEST_TARGETS))
-      GTEST_BUILD_RESULT := $(shell $(MAKE) SKIP_BUILDDEPS_CHECK=1 $(GTEST_HEADERS))
-      _ := $(shell sync)
-      $(if $(shell test -f $(GTEST_HEADERS) && echo EXISTS),,$(error FATAL: $(GTEST_HEADERS) still missing after download attempt))
-    endif
-  endif
-
-  # Check if xgboost headers are being built
-  XGBOOST_TARGETS := zli gtests test all test-cli
-  BUILDING_XGBOOST_TARGETS := $(filter $(XGBOOST_TARGETS),$(MAKECMDGOALS))
-  ifeq ($(MAKECMDGOALS),)
-    # If no targets are specified, assume we're building everything
-    BUILDING_XGBOOST_TARGETS := zli
-  endif
-
-  ifneq ($(BUILDING_XGBOOST_TARGETS),)
-    # Download XGBoost library
-    ifeq ($(wildcard $(XGBOOST_HEADER)),)
-      $(info Downloading xgboost dependency for targets: $(BUILDING_XGBOOST_TARGETS))
-      XGBOOST_BUILD_RESULT := $(shell $(MAKE) SKIP_BUILDDEPS_CHECK=1 $(XGBOOST_HEADER))
-      _ := $(shell sync)
-      $(if $(shell test -f $(XGBOOST_HEADER) && echo EXISTS),,$(error FATAL: $(XGBOOST_HEADER) still missing after download attempt))
-    endif
-  endif
-endif
 
 # Set EXEC_PREFIX to prefix every build output that is run in tests.
 # E.g.qemu
@@ -149,9 +118,6 @@ SDDL2_COMPILER_CXXOBJS := $(filter-out %main.o, $(call cxx_objs,$(SDDL2_COMPILER
 SDDL2_ASSEMBLER_CXXOBJS :=  $(filter-out %main.o, $(call cxx_objs,$(SDDL2_ASSEMBLER_DIR)))
 ML_SELECTOR_COBJS := $(call c_objs,$(ML_SELECTOR_DIR))
 ML_SELECTOR_CXXOBJS := $(call cxx_objs,$(ML_SELECTOR_DIR))
-
-# ML selector files depend on xgboost headers
-$(ML_SELECTOR_COBJS) $(ML_SELECTOR_CXXOBJS): | $(XGBOOST_HEADER)
 
 ML_SELECTOR_CPPFLAGS := -Ideps/xgboost/include -Ideps/xgboost/dmlc-core/include -DDMLC_LOG_STACK_TRACE=0 -DOPENZL_HAS_ML_SELECTOR_TRAINER=1
 
@@ -239,8 +205,8 @@ $(eval $(call c_program_shared_o,stream_dump2, \
 $(eval $(call cxx_program,sddl_compiler, \
 	$(SDDL_COMPILER_DIR)/main.o \
 	$(SDDL_COMPILER_CXXOBJS) \
-	$(ZLCPP_OBJS), \
-	libopenzl.a \
+	$(ZLCPP_OBJS) \
+	$(LIBOBJS), \
 	$(LIBZSTD_A) $(LIBLZ4_A)))
 
 # Selection of gtest units (by file name convention)
@@ -302,6 +268,11 @@ ALL_GTESTS_OBJS := \
 	$(ZLCPP_OBJS) \
 	$(LIBOBJS)
 
+# Objects wait for the headers of the dependencies they include, which are fetched on demand
+$(call mcm_order_deps,$(C_OBJS) $(CPP_OBJS),$(ZSTD_HEADER) $(LZ4_HEADER))
+$(call mcm_order_deps,$(ML_SELECTOR_COBJS) $(ML_SELECTOR_CXXOBJS),$(XGBOOST_HEADER))
+$(call mcm_order_deps,$(filter tests/% %/tests/%,$(ALL_GTESTS_OBJS)),$(GTEST_HEADERS))
+
 gtests: $(LIBGTEST_A) $(LIBZSTD_A) $(LIBLZ4_A) $(LIBXGBOOST_A)
 gtests: CPPFLAGS += -Ideps/googletest/googletest/include
 gtests: CXXFLAGS += -Wno-undef -Wno-sign-compare
@@ -350,23 +321,17 @@ $(CACHE_ROOT)/%/tests/unittest/common/test_debug.o: CXXFLAGS += -Wno-ignored-att
 
 # ********     Dependencies     ********
 
-CURL ?= curl
-GIT ?= git
-TAR ?= tar
+# Provides fetch_dependency, check-dependency-pins and cleandeps
+include build-scripts/make/deps.make
 
-# Use this target as a work-around if dependencies are not correctly built
-# automatically.
+# Source files of a dependency, in directories $(1) with extensions $(2).
+# Its library is rebuilt when any of them changes; since the sub-build may then
+# find nothing to do, the library is touched afterwards.
+dep_srcs = $(wildcard $(foreach d,$(1),$(addprefix $(d)/*.,$(2))))
+
+# Builds all dependencies ahead of time
 .PHONY : builddeps
 builddeps : $(LIBGTEST_A) $(LIBZSTD_A) $(LIBZSTD_SO) $(LIBLZ4_A) $(LIBLZ4_SO)
-
-.PHONY: cleandeps
-cleandeps:
-	$(RM) -r deps/googletest deps/googletest.tar.gz
-	-$(GIT) submodule deinit -f deps/zstd 2> /dev/null
-	$(RM) -r deps/zstd deps/$(ZSTD_DIRNAME) $(ZSTD_TARBALL)
-	-$(GIT) submodule deinit -f deps/lz4 2> /dev/null
-	$(RM) -r deps/lz4 deps/$(LZ4_DIRNAME) $(LZ4_TARBALL)
-	$(RM) -r deps/xgboost deps/xgboost.tar.gz
 
 # Variables are by default not exported, but when they're passed on the CLI,
 # they are exported. We do not want to pass super restrictive flags to our
@@ -375,118 +340,60 @@ unexport CFLAGS
 unexport CXXFLAGS
 
 # Zstandard
+ZSTD_VERSION ?= 1.5.7
+ZSTD_SHA256 ?= eb33e51f49a15e023950cd7825ca74a4a2b43db8354825ac24fc1b7ee09e6fa3
+$(eval $(call fetch_dependency,zstd,lib/zstd.h,v$(ZSTD_VERSION),https://github.com/facebook/zstd/releases/download/v$(ZSTD_VERSION)/zstd-$(ZSTD_VERSION).tar.gz,$(ZSTD_SHA256)))
 
 ZSTD_LIBDIR := deps/zstd/lib
-ZSTD_HEADER := $(ZSTD_LIBDIR)/zstd.h
-ZSTD_MAKEFILE := $(ZSTD_LIBDIR)/Makefile
-
-ZSTD_VERSION ?= 1.5.7
-ZSTD_DIRNAME := zstd-$(ZSTD_VERSION)
-ZSTD_TARBALL := deps/$(ZSTD_DIRNAME).tar.gz
-
-$(ZSTD_TARBALL):
-	$(MKDIR) -p deps
-	$(CURL) -L https://github.com/facebook/zstd/releases/download/v$(ZSTD_VERSION)/$(ZSTD_DIRNAME).tar.gz -o $@
-
-.PHONY: zstd-fallback
-zstd-fallback: $(ZSTD_TARBALL)
-	$(RM) -r deps/$(ZSTD_DIRNAME)
-	$(TAR) -xzf $(ZSTD_TARBALL) -C deps
-	$(RM) -r deps/zstd
-	mv deps/$(ZSTD_DIRNAME) deps/zstd
-
-$(ZSTD_HEADER):
-	-$(GIT) submodule update --init --single-branch --depth 1 deps/zstd
-	if [ ! -f $@ ]; then \
-		echo "Falling back to tarball download and extraction for zstd"; \
-		$(MAKE) zstd-fallback; \
-	fi
-
-$(ZSTD_MAKEFILE): $(ZSTD_HEADER)
-	touch $@
+ZSTD_SRCS := $(call dep_srcs,$(ZSTD_LIBDIR) $(ZSTD_LIBDIR)/*,c h S)
 
 $(LIBZSTD_SO) : MAKEOVERRIDES=
-$(LIBZSTD_SO) : $(ZSTD_MAKEFILE)
+$(LIBZSTD_SO) : $(ZSTD_HEADER) $(ZSTD_SRCS)
 	$(MAKE) -C $(ZSTD_LIBDIR) libzstd
-
-$(LIBZSTD_A) : MAKEOVERRIDES=
-$(LIBZSTD_A) : $(ZSTD_MAKEFILE)
-	$(MAKE) -C $(ZSTD_LIBDIR) libzstd.a
-
-# LZ4
-LZ4_LIBDIR := deps/lz4/lib
-LZ4_HEADER := $(LZ4_LIBDIR)/lz4.h
-LZ4_MAKEFILE := $(LZ4_LIBDIR)/Makefile
-
-LZ4_VERSION ?= 1.10.0
-LZ4_DIRNAME := lz4-$(LZ4_VERSION)
-LZ4_TARBALL := deps/$(LZ4_DIRNAME).tar.gz
-
-$(LZ4_TARBALL):
-	$(MKDIR) -p deps
-	$(CURL) -L https://github.com/lz4/lz4/releases/download/v$(LZ4_VERSION)/$(LZ4_DIRNAME).tar.gz -o $@
-
-.PHONY: lz4-fallback
-lz4-fallback: $(LZ4_TARBALL)
-	$(RM) -r deps/$(LZ4_DIRNAME)
-	$(TAR) -xzf $(LZ4_TARBALL) -C deps
-	$(RM) -r deps/lz4
-	mv deps/$(LZ4_DIRNAME) deps/lz4
-
-$(LZ4_HEADER):
-	-$(GIT) submodule update --init --single-branch --depth 1 deps/lz4
-	if [ ! -f $@ ]; then \
-		echo "Falling back to tarball download and extraction for lz4"; \
-		$(MAKE) lz4-fallback; \
-	fi
-
-$(LZ4_MAKEFILE): $(LZ4_HEADER)
 	touch $@
 
+$(LIBZSTD_A) : MAKEOVERRIDES=
+$(LIBZSTD_A) : $(ZSTD_HEADER) $(ZSTD_SRCS)
+	$(MAKE) -C $(ZSTD_LIBDIR) libzstd.a
+	touch $@
+
+# LZ4
+LZ4_VERSION ?= 1.10.0
+LZ4_SHA256 ?= 537512904744b35e232912055ccf8ec66d768639ff3abe5788d90d792ec5f48b
+$(eval $(call fetch_dependency,lz4,lib/lz4.h,v$(LZ4_VERSION),https://github.com/lz4/lz4/releases/download/v$(LZ4_VERSION)/lz4-$(LZ4_VERSION).tar.gz,$(LZ4_SHA256)))
+
+LZ4_LIBDIR := deps/lz4/lib
+LZ4_SRCS := $(call dep_srcs,$(LZ4_LIBDIR),c h)
+
 $(LIBLZ4_SO) : MAKEOVERRIDES=
-$(LIBLZ4_SO) : $(LZ4_MAKEFILE)
+$(LIBLZ4_SO) : $(LZ4_HEADER) $(LZ4_SRCS)
 	$(MAKE) -C $(LZ4_LIBDIR) liblz4
+	touch $@
 
 $(LIBLZ4_A) : MAKEOVERRIDES=
-$(LIBLZ4_A) : $(LZ4_MAKEFILE)
+$(LIBLZ4_A) : $(LZ4_HEADER) $(LZ4_SRCS)
 	$(MAKE) -C $(LZ4_LIBDIR) liblz4.a
+	touch $@
 
 # Google Test
-
 GTEST_VERSION ?= 1.17.0
-GTEST_DIRNAME := googletest-$(GTEST_VERSION)
-GTEST_TARBALL := deps/$(GTEST_DIRNAME).tar.gz
+GTEST_SHA256 ?= 65fab701d9829d38cb77c14acdc431d2108bfdbf8979e40eb8ae567edf10b27c
+$(eval $(call fetch_dependency,googletest,googletest/include/gtest/gtest.h,v$(GTEST_VERSION),https://github.com/google/googletest/releases/download/v$(GTEST_VERSION)/googletest-$(GTEST_VERSION).tar.gz,$(GTEST_SHA256)))
 
-$(GTEST_TARBALL):
-	$(MKDIR) -p deps
-	$(CURL) -L https://github.com/google/googletest/releases/download/v$(GTEST_VERSION)/$(GTEST_DIRNAME).tar.gz -o $@
-
-.PHONY: gtest-fallback
-gtest-fallback: $(GTEST_TARBALL)
-	$(RM) -r deps/$(GTEST_DIRNAME)
-	$(TAR) -xzf $(GTEST_TARBALL) -C deps
-	$(RM) -r deps/googletest
-	mv deps/$(GTEST_DIRNAME) deps/googletest
-
-# Ensure headers are available - prefer submodule, fallback to tarball
-$(GTEST_HEADERS):
-	-$(GIT) submodule update --init --single-branch --depth 1 deps/googletest
-	if [ ! -f $@ ]; then \
-		echo "Falling back to tarball download and extraction for googletest"; \
-		$(MAKE) gtest-fallback; \
-	fi
+GTEST_SRCS := $(call dep_srcs,$(addprefix deps/googletest/googletest/,src include/gtest include/gtest/internal include/gtest/internal/custom),cc h)
 
 $(LIBGTEST_A) : MAKEOVERRIDES=
-$(LIBGTEST_A) : $(GTEST_HEADERS)
+$(LIBGTEST_A) : $(GTEST_HEADERS) $(GTEST_SRCS)
 	cd deps/googletest && cmake .
 	$(MAKE) -C deps/googletest
+	touch $@
 
 # XGBoost
-XGBOOST_LIBDIR := deps/xgboost/lib
-
 XGBOOST_VERSION ?= 3.1.0
-XGBOOST_DIRNAME := xgboost-src-$(XGBOOST_VERSION)
-XGBOOST_TARBALL := deps/$(XGBOOST_DIRNAME).tar.gz
+XGBOOST_SHA256 ?= 4c42d35976067270a9255bf9ee290a706917bb3929a60cdd74d4dd3f1a9c86cc
+$(eval $(call fetch_dependency,xgboost,include/xgboost/c_api.h,v$(XGBOOST_VERSION),https://github.com/dmlc/xgboost/releases/download/v$(XGBOOST_VERSION)/xgboost-src-$(XGBOOST_VERSION).tar.gz,$(XGBOOST_SHA256),--recursive))
+
+XGBOOST_LIBDIR := deps/xgboost/lib
 
 # Common CMake flags for xgboost shared library build
 XGBOOST_CMAKE_COMMON := -DBUILD_STATIC_LIB=OFF -DUSE_OPENMP=OFF \
@@ -509,25 +416,6 @@ else ifeq ($(shell uname),Darwin)
         -DCMAKE_BUILD_WITH_INSTALL_RPATH=ON -DCMAKE_MACOSX_RPATH=ON
 endif
 
-$(XGBOOST_TARBALL):
-	$(MKDIR) -p deps
-	$(CURL) -L https://github.com/dmlc/xgboost/releases/download/v$(XGBOOST_VERSION)/$(XGBOOST_DIRNAME).tar.gz -o $@
-
-.PHONY: xgboost-fallback
-xgboost-fallback: $(XGBOOST_TARBALL)
-	$(RM) -r deps/xgboost
-	$(TAR) -xzf $(XGBOOST_TARBALL) -C deps
-	@if [ -d deps/$(XGBOOST_DIRNAME) ] && [ ! -d deps/xgboost ]; then \
-		mv deps/$(XGBOOST_DIRNAME) deps/xgboost; \
-	fi
-
-$(XGBOOST_HEADER):
-	-$(GIT) submodule update --init --recursive --single-branch --depth 1 deps/xgboost
-	if [ ! -f $@ ]; then \
-		echo "Falling back to tarball download and extraction for xgboost"; \
-		$(MAKE) xgboost-fallback; \
-	fi
-
 # Build shared library only after static library is done (to avoid parallel cmake conflicts)
 $(LIBXGBOOST_SO) : MAKEOVERRIDES=
 $(LIBXGBOOST_SO) : $(LIBXGBOOST_A)
@@ -538,15 +426,22 @@ ifeq ($(shell uname),Darwin)
 	install_name_tool -id "$(abspath $(XGBOOST_LIBDIR))/libxgboost.dylib" \
 		"$(abspath $(XGBOOST_LIBDIR))/libxgboost.dylib" || true
 endif
+	touch $@
+
+XGBOOST_SRCS := $(call dep_srcs,$(addprefix deps/xgboost/,src src/* src/*/* include/xgboost include/xgboost/* dmlc-core/src dmlc-core/src/* dmlc-core/include/dmlc),cc cu cuh h)
 
 $(LIBXGBOOST_A) : MAKEOVERRIDES=
-$(LIBXGBOOST_A) : $(XGBOOST_HEADER)
+$(LIBXGBOOST_A) : $(XGBOOST_HEADER) $(XGBOOST_SRCS)
 	$(MKDIR) -p $(XGBOOST_LIBDIR)
 	cd deps/xgboost && mkdir -p build && cd build && cmake .. -DBUILD_STATIC_LIB=ON -DUSE_OPENMP=OFF -DCMAKE_ARCHIVE_OUTPUT_DIRECTORY=$(abspath $(XGBOOST_LIBDIR)) $(XGBOOST_CMAKE_PLATFORM) && $(MAKE)
 	# xgboost's CMakeLists.txt strips the 'lib' prefix on Windows; rename to match expected name
 	@if [ -f $(XGBOOST_LIBDIR)/xgboost.a ] && [ ! -f $(XGBOOST_LIBDIR)/libxgboost.a ]; then \
 		mv $(XGBOOST_LIBDIR)/xgboost.a $(XGBOOST_LIBDIR)/libxgboost.a; \
 	fi
+	touch $@
 
 # libdmlc.a is built as part of xgboost static build
 $(LIBDMLC_A): $(LIBXGBOOST_A)
+
+# Empty rule: stops make searching implicit rules for each dependency source (~100 failed stat() each)
+$(filter-out $(ZSTD_HEADER) $(LZ4_HEADER) $(GTEST_HEADERS) $(XGBOOST_HEADER),$(ZSTD_SRCS) $(LZ4_SRCS) $(GTEST_SRCS) $(XGBOOST_SRCS)): ;
