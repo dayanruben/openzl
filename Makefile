@@ -40,15 +40,12 @@ endif
 ifneq (,$(filter Windows%,$(OS)))
 LIBZSTD_SO := deps/zstd/lib/dll/libzstd.dll
 LIBLZ4_SO := deps/lz4/lib/liblz4.dll
-LIBXGBOOST_SO := deps/xgboost/lib/libxgboost.dll
 else ifeq ($(shell uname), Darwin)
 LIBZSTD_SO := deps/zstd/lib/libzstd.dylib
 LIBLZ4_SO := deps/lz4/lib/liblz4.dylib
-LIBXGBOOST_SO := deps/xgboost/lib/libxgboost.dylib
 else
 LIBZSTD_SO := deps/zstd/lib/libzstd.so
 LIBLZ4_SO := deps/lz4/lib/liblz4.so
-LIBXGBOOST_SO := deps/xgboost/lib/libxgboost.so
 endif
 
 LIBZSTD_A := deps/zstd/lib/libzstd.a
@@ -174,7 +171,7 @@ GTEST_FILTER_LIST := VersionTest.o NoIntrospectionTest.o
 GTEST_FILEO := $(filter-out $(GTEST_FILTER_LIST),$(GTEST_FILEO))
 
 ALL_TEST_OBJS := $(filter tests/% cli/tests/% tools/ml_selector/tests/%,$(CXX_OBJS))
-GTEST_OBJS := $(foreach name,$(GTEST_FILEO),$(filter %/$(name),$(ALL_TEST_OBJS)))
+GTEST_OBJS := $(filter $(addprefix %/,$(GTEST_FILEO)),$(ALL_TEST_OBJS))
 
 # Other module objects used in gtests
 DATAGEN_OBJS := \
@@ -311,14 +308,6 @@ $(LIBLZ4_A) : $(LZ4_HEADER) $(LZ4_SRCS)
 	$(MAKE) -C $(LZ4_LIBDIR) liblz4.a
 	touch $@
 
-# build-scripts/cmake/openzl-deps.cmake must pin the same zstd and lz4 tarballs
-check-dependency-pins: check-cmake-pins
-.PHONY: check-cmake-pins
-check-cmake-pins:
-	@for v in $(ZSTD_VERSION) $(ZSTD_SHA256) $(LZ4_VERSION) $(LZ4_SHA256); do \
-	    grep -q "\"$$v\"" build-scripts/cmake/openzl-deps.cmake || \
-	    { echo "error: build-scripts/cmake/openzl-deps.cmake lacks \"$$v\"" >&2; exit 1; }; done
-
 # Google Test
 GTEST_VERSION ?= 1.17.0
 GTEST_SHA256 ?= 65fab701d9829d38cb77c14acdc431d2108bfdbf8979e40eb8ae567edf10b27c
@@ -332,16 +321,22 @@ $(LIBGTEST_A) : $(GTEST_HEADERS) $(GTEST_SRCS)
 	$(MAKE) -C deps/googletest
 	touch $@
 
+# build-scripts/cmake/openzl-deps.cmake and CMakeLists.txt must pin the same tarballs
+check-dependency-pins: check-cmake-pins
+.PHONY: check-cmake-pins
+check-cmake-pins:
+	@for v in $(ZSTD_VERSION) $(ZSTD_SHA256) $(LZ4_VERSION) $(LZ4_SHA256); do \
+	    grep -q "\"$$v\"" build-scripts/cmake/openzl-deps.cmake || \
+	    { echo "error: build-scripts/cmake/openzl-deps.cmake lacks \"$$v\"" >&2; exit 1; }; done
+	@for v in googletest-$(GTEST_VERSION).tar.gz $(GTEST_SHA256); do \
+	    grep -qF "$$v" CMakeLists.txt || { echo "error: CMakeLists.txt lacks $$v" >&2; exit 1; }; done
+
 # XGBoost
 XGBOOST_VERSION ?= 3.1.0
 XGBOOST_SHA256 ?= 4c42d35976067270a9255bf9ee290a706917bb3929a60cdd74d4dd3f1a9c86cc
 $(eval $(call fetch_dependency,xgboost,include/xgboost/c_api.h,v$(XGBOOST_VERSION),https://github.com/dmlc/xgboost/releases/download/v$(XGBOOST_VERSION)/xgboost-src-$(XGBOOST_VERSION).tar.gz,$(XGBOOST_SHA256),--recursive))
 
 XGBOOST_LIBDIR := deps/xgboost/lib
-
-# Common CMake flags for xgboost shared library build
-XGBOOST_CMAKE_COMMON := -DBUILD_STATIC_LIB=OFF -DUSE_OPENMP=OFF \
-	-DCMAKE_LIBRARY_OUTPUT_DIRECTORY=$(abspath $(XGBOOST_LIBDIR))
 
 # Platform-specific CMake flags for xgboost
 XGBOOST_CMAKE_PLATFORM :=
@@ -354,23 +349,7 @@ ifneq (,$(filter $(SMALL_CMD_LINE),$(UNAME)))
         -DCMAKE_SHARED_LINKER_FLAGS="-lws2_32"
     XGBOOST_LDFLAGS += -L$(abspath $(XGBOOST_LIBDIR))
     XGBOOST_LDLIBS += -lws2_32
-else ifeq ($(shell uname),Darwin)
-    # macOS: Set install_name to absolute path so dyld can find the library
-    XGBOOST_CMAKE_PLATFORM := -DCMAKE_INSTALL_NAME_DIR=$(abspath $(XGBOOST_LIBDIR)) \
-        -DCMAKE_BUILD_WITH_INSTALL_RPATH=ON -DCMAKE_MACOSX_RPATH=ON
 endif
-
-# Build shared library only after static library is done (to avoid parallel cmake conflicts)
-$(LIBXGBOOST_SO) : MAKEOVERRIDES=
-$(LIBXGBOOST_SO) : $(LIBXGBOOST_A)
-	$(MKDIR) -p $(XGBOOST_LIBDIR)
-	cd deps/xgboost && mkdir -p build-shared && cd build-shared && \
-		cmake .. $(XGBOOST_CMAKE_COMMON) $(XGBOOST_CMAKE_PLATFORM) && $(MAKE)
-ifeq ($(shell uname),Darwin)
-	install_name_tool -id "$(abspath $(XGBOOST_LIBDIR))/libxgboost.dylib" \
-		"$(abspath $(XGBOOST_LIBDIR))/libxgboost.dylib" || true
-endif
-	touch $@
 
 XGBOOST_SRCS := $(call dep_srcs,$(addprefix deps/xgboost/,src src/* src/*/* include/xgboost include/xgboost/* dmlc-core/src dmlc-core/src/* dmlc-core/include/dmlc),cc cu cuh h)
 
