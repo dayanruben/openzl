@@ -12,7 +12,6 @@
 #include "openzl/codecs/zl_generic.h"
 #include "openzl/codecs/zl_mlselector.h"
 #include "openzl/codecs/zl_sddl2.h"
-#include "openzl/codecs/zl_segmenters.h"
 #include "openzl/common/assertion.h"
 #include "openzl/cpp/Exception.hpp"
 #include "openzl/openzl.hpp"
@@ -23,6 +22,7 @@
 #include "custom_parsers/dependency_registration.h"
 #include "custom_parsers/parquet/parquet_graph.h"
 #include "custom_parsers/pytorch_model_parser.h"
+#include "custom_parsers/safetensors/safetensors_parser.h"
 #include "custom_parsers/sddl/sddl_profile.h"
 #include "custom_parsers/shared_components/clustering.h"
 
@@ -191,17 +191,6 @@ makeProfileName(const std::string& signage, size_t bitWidth, bool isBigEndian)
     return (isBigEndian ? "be-" : "le-") + signage + std::to_string(bitWidth);
 }
 
-static std::string
-makeProfileDescription(bool isSigned, size_t bitWidth, bool isBigEndian)
-{
-    if (bitWidth == 8) {
-        return (isSigned ? "Signed " : "Unsigned ") + std::string("8-bit data");
-    }
-    return std::string(isBigEndian ? "Big-endian " : "Little-endian ")
-            + (isSigned ? "signed " : "unsigned ") + std::to_string(bitWidth)
-            + "-bit data";
-}
-
 static ZL_GraphID
 buildIntProfile(ZL_Compressor* comp, void* opaque, const ProfileArgs& args)
 {
@@ -231,8 +220,6 @@ static void addIntProfile(
     ZL_ASSERT_OR(bitWidth != 8, !isBigEndian);
     const std::string signage = isSigned ? "i" : "u";
     const std::string name    = makeProfileName(signage, bitWidth, isBigEndian);
-    const std::string description =
-            makeProfileDescription(isSigned, bitWidth, isBigEndian);
     const ZL_NodeID conversionNode = isBigEndian
             ? ZL_Node_convertSerialToNumBE(bitWidth)
             : ZL_Node_convertSerialToNumLE(bitWidth);
@@ -241,7 +228,11 @@ static void addIntProfile(
             IntProfileData{ bitWidth / 8, conversionNode });
 
     mp[name] = std::make_shared<CompressProfile>(
-            name, description, buildIntProfile, std::move(data), true);
+            name,
+            profiles::getProfileDescription(name),
+            buildIntProfile,
+            std::move(data),
+            true);
 }
 } // namespace
 
@@ -353,13 +344,14 @@ static ZL_RESULT_OF(ZL_GraphID)
 const std::map<std::string, std::shared_ptr<CompressProfile>>&
 compressProfiles()
 {
-    static const std::map<std::string, std::shared_ptr<CompressProfile>> staticProfiles = []() {
+    using ProfileMap = std::map<std::string, std::shared_ptr<CompressProfile>>;
+    static const ProfileMap staticProfiles = []() {
         std::map<std::string, std::shared_ptr<CompressProfile>> mp;
 
         std::string kSerialName = "serial";
         mp[kSerialName]         = std::make_shared<CompressProfile>(
                 kSerialName,
-                "Serial data (aka raw bytes)",
+                profiles::getProfileDescription(kSerialName),
                 [](ZL_Compressor* compressor, void*, const ProfileArgs& args) {
                     size_t chunkSize = args.chunkSize().value_or(
                             ZL_DEFAULT_SEGMENTER_CHUNK_BYTE_SIZE);
@@ -371,14 +363,11 @@ compressProfiles()
         const std::string kLz = "lz";
         mp[kLz]               = std::make_shared<CompressProfile>(
                 kLz,
-                "Trainable LZ compressor",
+                profiles::getProfileDescription(kLz),
                 [](ZL_Compressor* compressor, void*, const ProfileArgs& args) {
-                    CompressorRef c(compressor);
-                    ZL_GraphID inner = graphs::Lz{}(c);
                     size_t chunkSize = args.chunkSize().value_or(
                             ZL_DEFAULT_SEGMENTER_CHUNK_BYTE_SIZE);
-                    return ZL_Compressor_buildSerialSegmenter(
-                            compressor, chunkSize, inner);
+                    return profiles::buildLzGraph(compressor, chunkSize);
                 },
                 nullptr,
                 true);
@@ -386,10 +375,9 @@ compressProfiles()
         std::string kZstd = "zstd";
         mp[kZstd]         = std::make_shared<CompressProfile>(
                 kZstd,
-                "Use this profile to train a Zstd dict",
+                profiles::getProfileDescription(kZstd),
                 [](ZL_Compressor* compressor, void*, const ProfileArgs&) {
-                    return ZL_RES_value(
-                            ZL_Compressor_buildTrainableZstdGraph(compressor));
+                    return profiles::buildZstdGraph(compressor);
                 },
                 nullptr,
                 false);
@@ -397,15 +385,15 @@ compressProfiles()
         std::string kPytorchName = "pytorch";
         mp[kPytorchName]         = std::make_shared<CompressProfile>(
                 kPytorchName,
-                "Pytorch model generated from torch.save(). Training is not supported.",
+                profiles::getProfileDescription(kPytorchName),
                 [](ZL_Compressor* comp, void*, const ProfileArgs&) {
-                    return ZS2_createGraph_pytorchModelCompressor(comp);
+                    return profiles::buildPytorchGraph(comp);
                 });
 
         std::string kCsvName = "csv";
         mp[kCsvName]         = std::make_shared<CompressProfile>(
                 kCsvName,
-                "CSV. Pass optional non-comma separator with --profile-arg <char>.",
+                profiles::getProfileDescription(kCsvName),
                 [](ZL_Compressor* comp, void*, const ProfileArgs& args) {
                     char sep             = ',';
                     const auto chunkSize = args.chunkSize().value_or(
@@ -420,9 +408,28 @@ compressProfiles()
                         }
                         sep = str[0];
                     }
-                    return openzl::custom_parsers::
-                            ZL_createGraph_genericCSVCompressorWithOptions(
-                                    comp, chunkSize, true, sep, false);
+                    return profiles::buildCsvGraph(comp, chunkSize, sep);
+                },
+                nullptr,
+                true);
+
+        std::string kSafetensorsName = "safetensors";
+        mp[kSafetensorsName]         = std::make_shared<CompressProfile>(
+                kSafetensorsName,
+                "Safetensors model checkpoint (e.g. Hugging Face model.safetensors).",
+                [](ZL_Compressor* comp, void*, const ProfileArgs& args) {
+                    const auto graph = ZL_Safetensors_registerGraph(
+                            comp,
+                            args.chunkSize().value_or(
+                                    ZL_SAFETENSORS_DEFAULT_CHUNK_SIZE));
+                    if (ZL_RES_isError(graph)) {
+                        throw InvalidArgsException(
+                                std::string(
+                                        "Failed to build the safetensors profile: ")
+                                + ZL_Compressor_getErrorContextString_fromError(
+                                        comp, ZL_RES_error(graph)));
+                    }
+                    return ZL_RES_value(graph);
                 },
                 nullptr,
                 true);
@@ -445,9 +452,8 @@ compressProfiles()
         std::string kParquetName = "parquet";
         mp[kParquetName]         = std::make_shared<CompressProfile>(
                 kParquetName,
-                "Parquet in the canonical format (no compression, plain encoding)",
+                profiles::getProfileDescription(kParquetName),
                 [](ZL_Compressor* comp, void*, const ProfileArgs& args) {
-                    auto clustering = ZS2_createGraph_genericClustering(comp);
                     const size_t chunkSize = args.chunkSize().value_or(
                             custom_parsers::kDefaultChunkSize);
                     if (chunkSize > static_cast<size_t>(
@@ -458,8 +464,7 @@ compressProfiles()
                                         std::numeric_limits<int>::max())
                                 + " bytes.");
                     }
-                    return ZL_Parquet_registerGraph_withChunkSize(
-                            comp, clustering, static_cast<int>(chunkSize));
+                    return profiles::buildParquetGraph(comp, chunkSize);
                 },
                 nullptr,
                 true);
@@ -467,7 +472,7 @@ compressProfiles()
         std::string kSDDLName = "sddl";
         mp[kSDDLName]         = std::make_shared<CompressProfile>(
                 kSDDLName,
-                "Data that can be parsed using the Simple Data Description Language. Pass a path to the data description file with --profile-arg.",
+                profiles::getProfileDescription(kSDDLName),
                 [](ZL_Compressor* comp, void*, const ProfileArgs& args) {
                     auto argmap = args.map();
                     auto it     = argmap.find("TBD");
@@ -488,7 +493,7 @@ compressProfiles()
         std::string kSDDL2Name = "sddl2";
         mp[kSDDL2Name]         = std::make_shared<CompressProfile>(
                 kSDDL2Name,
-                "Data that can be parsed using Simple Data Description Language v2 (https://openzl.org/sddl/). Pass a path to the description file with --profile-arg.",
+                profiles::getProfileDescription(kSDDL2Name),
                 [](ZL_Compressor* comp, void*, const ProfileArgs& args) {
                     auto argmap = args.map();
                     auto it     = argmap.find("TBD");
@@ -530,7 +535,7 @@ compressProfiles()
         std::string kSAOName = "sao";
         mp[kSAOName]         = std::make_shared<CompressProfile>(
                 kSAOName,
-                "SAO format from the Silesia corpus",
+                profiles::getProfileDescription(kSAOName),
                 [](ZL_Compressor* comp, void*, const ProfileArgs& args) {
                     CompressorRef compressor(comp);
                     return saoProfile(compressor, args);
@@ -539,7 +544,7 @@ compressProfiles()
         std::string kGenericNumericName = "numeric-ml-selector-64";
         mp[kGenericNumericName]         = std::make_shared<CompressProfile>(
                 kGenericNumericName,
-                "64 bit numeric data using ml selectors (Placeholder)",
+                profiles::getProfileDescription(kGenericNumericName),
                 [](ZL_Compressor* comp, void*, const ProfileArgs& args) {
                     (void)args;
                     if (args.map().find("TBD") != args.map().end()) {
