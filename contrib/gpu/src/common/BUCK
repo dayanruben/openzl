@@ -67,36 +67,22 @@ cpp_library(
     exported_external_deps = [("cuda", None, "cuda-lazy")],
 )
 
-# Host C++ error helpers. Device code reports errors through status arrays.
 cpp_library(
-    # @autodeps-skip
-    name = "errors",
-    srcs = ["errors.cpp"],
-    headers = relative_headers(["errors.hpp"]),
+    name = "result",
+    headers = relative_headers(["result.hpp"]),
     header_namespace = "",
-    deps = ["../../../..:zstronglib"],
-    exported_deps = ["../../../../cpp:openzl_cpp"],
+    exported_deps = ["../../../..:zstronglib"],
 )
 
 cpp_unittest(
-    # @autodeps-skip
-    name = "errors_test",
-    srcs = ["tests/ErrorsTest.cpp"],
+    name = "result_test",
+    srcs = ["tests/ResultTest.cpp"],
     network_access = network_access_utils.none(),
     deps = [
-        "../../../../cpp:openzl_cpp",
+        "../../../..:zstronglib",
         "fbsource//third-party/googletest:gtest",
-        ":error_testing",
-        ":errors",
+        ":result",
     ],
-)
-
-cpp_library(
-    # @autodeps-skip
-    name = "error_testing",
-    headers = relative_headers(["tests/error_testing.hpp"]),
-    header_namespace = "",
-    exported_deps = ["../../../../cpp:openzl_cpp"],
 )
 
 # CPU metadata contract shared by codec planners and the decode scheduler.
