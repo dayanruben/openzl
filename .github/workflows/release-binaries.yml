@@ -33,7 +33,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: Checkout repository
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
 
       - name: Check version consistency
         run: |
@@ -62,7 +62,7 @@ jobs:
         shell: msys2 {0}
     steps:
       - name: Checkout repository
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
 
       - name: Setup MSYS2 with MinGW-w64
         uses: msys2/setup-msys2@v2
@@ -121,7 +121,7 @@ jobs:
           GH_TOKEN: ${{ github.token }}
 
       - name: Upload artifact (for manual workflow runs)
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: openzl-cli-windows-x64
           path: release\openzl-cli-windows-x64.exe

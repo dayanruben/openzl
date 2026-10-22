@@ -36,7 +36,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
       # Restoring the artifact is what keeps a docs-only change off the
       # Emscripten toolchain entirely. The key covers everything the binding
       # links -- the set wasm-ci.yml filters on, `**/CMakeLists.txt` included,
@@ -48,7 +48,7 @@ jobs:
       # a pull request to restore what the branch build already compiled.
       - name: Cache WASM artifact
         id: wasm-cache
-        uses: actions/cache@v4
+        uses: actions/cache@v6
         with:
           path: build-wasm/tools/wasm
           key: >-
@@ -90,7 +90,7 @@ jobs:
         if: steps.wasm-cache.outputs.cache-hit != 'true'
         run: emstrip --strip-debug build-wasm/tools/wasm/openzl.wasm
       - name: Upload WASM artifact
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: openzl-wasm
           path: |
@@ -107,11 +107,11 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
         with:
           submodules: recursive
       - name: Set up Node
-        uses: actions/setup-node@v4
+        uses: actions/setup-node@v7
         with:
           node-version: lts/*
           cache: 'yarn'
@@ -121,7 +121,7 @@ jobs:
       # `new URL('./openzl.wasm', import.meta.url)`, which Vite resolves at
       # build time and re-emits under assets/ with a content hash.
       - name: Download WASM artifact
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v7
         with:
           name: openzl-wasm
           path: ${{github.workspace}}/tools/wasm/js
