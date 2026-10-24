@@ -61,7 +61,7 @@ jobs:
             '.github/workflows/test-deploy-docs.yml')}}
       - name: Set up Emscripten
         if: steps.wasm-cache.outputs.cache-hit != 'true'
-        uses: mymindstorm/setup-emsdk@v14
+        uses: emscripten-core/setup-emsdk@v16
         with:
           version: ${{env.EMSDK_VERSION}}
           actions-cache-folder: emsdk-cache
@@ -132,7 +132,7 @@ jobs:
         working-directory: ${{github.workspace}}/tools/web
         run: yarn build
       - name: Setup Pages
-        uses: actions/configure-pages@v5
+        uses: actions/configure-pages@v6
       - name: Setup mkdocs environment
         run: |
             sudo apt-get update
@@ -152,9 +152,10 @@ jobs:
       - name: Check the WASM module is in the playground build
         run: ls doc/mkdocs/build/tools/playground/assets/openzl-*.js doc/mkdocs/build/tools/playground/assets/openzl-*.wasm
       - name: Upload artifact
-        uses: actions/upload-pages-artifact@v3
+        uses: actions/upload-pages-artifact@v5
         with:
           path: './doc/mkdocs/build/'
+          include-hidden-files: true
 
 
   deploy:
@@ -167,4 +168,4 @@ jobs:
     steps:
       - name: Deploy to GitHub Pages
         id: deployment
-        uses: actions/deploy-pages@v4
+        uses: actions/deploy-pages@v5
