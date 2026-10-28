@@ -17,6 +17,7 @@ import {
   VStack,
   chakra,
   createListCollection,
+  useSlotRecipe,
 } from '@chakra-ui/react';
 import {LuChevronDown, LuChevronRight, LuInfo, LuPlus, LuX} from 'react-icons/lu';
 import StepCard from './StepCard.tsx';
@@ -67,6 +68,7 @@ interface ConfigureRunCardProps {
 }
 
 function OpenZlOptions({row, position, onPatch}: OpenZlRowProps) {
+  const helperTooltip = useSlotRecipe({key: 'helperTooltip'})();
   // A backstop for rows that arrive from elsewhere: the picker already refuses
   // pytorch, which the browser cannot run at all.
   const canTrain = isTrainableProfile(row.profile);
@@ -134,9 +136,9 @@ function OpenZlOptions({row, position, onPatch}: OpenZlRowProps) {
                 </Tooltip.Trigger>
                 <Portal>
                   <Tooltip.Positioner>
-                    <Tooltip.Content>
+                    <Tooltip.Content css={helperTooltip.content}>
                       <Tooltip.Arrow>
-                        <Tooltip.ArrowTip />
+                        <Tooltip.ArrowTip css={helperTooltip.arrowTip} />
                       </Tooltip.Arrow>
                       Compression level has no effect while training is on.
                     </Tooltip.Content>
@@ -205,7 +207,7 @@ function OpenZlOptions({row, position, onPatch}: OpenZlRowProps) {
               </Box>
               <Text color="pg.secondary" fontSize="11px" lineHeight="1.4" m={0}>
                 {canTrain
-                  ? 'Training learns a compressor from your data'
+                  ? 'Training builds a compression graph optimized for your data, using the selected profile as a starting point. This can take a while.'
                   : `Training is not supported for the ${row.profile} profile`}
               </Text>
             </Box>
@@ -225,6 +227,8 @@ function profileDescriptionId(rowId: number, profile: OpenZlProfile): string {
 }
 
 function ProfileSelect({row, position, onPatch}: OpenZlRowProps) {
+  const helperTooltip = useSlotRecipe({key: 'helperTooltip'})();
+  const triggerId = `row-${row.id}-profile-trigger`;
   const profiles = getOpenZlProfiles();
   /**
    * Runnable profiles first, the rest after, alphabetical within each group.
@@ -250,6 +254,7 @@ function ProfileSelect({row, position, onPatch}: OpenZlRowProps) {
 
   return (
     <Select.Root
+      ids={{trigger: triggerId}}
       disabled={profiles.length === 0}
       collection={profileCollection}
       size="sm"
@@ -274,14 +279,28 @@ function ProfileSelect({row, position, onPatch}: OpenZlRowProps) {
       {/* The indicator group must sit beside the trigger inside the control:
           it is absolutely positioned and the control is the only positioned
           ancestor — nested in the trigger, the arrow flies off-box. */}
-      <Select.Control>
-        <Select.Trigger bg="pg.surface" borderColor="pg.border" borderRadius="6px" px="12px" color="pg.ink">
-          <Select.ValueText />
-        </Select.Trigger>
-        <Select.IndicatorGroup>
-          <Select.Indicator />
-        </Select.IndicatorGroup>
-      </Select.Control>
+      <Tooltip.Root ids={{trigger: triggerId}} openDelay={200} positioning={{placement: 'top', gutter: 8}}>
+        <Select.Control>
+          <Tooltip.Trigger asChild>
+            <Select.Trigger bg="pg.surface" borderColor="pg.border" borderRadius="6px" px="12px" color="pg.ink">
+              <Select.ValueText />
+            </Select.Trigger>
+          </Tooltip.Trigger>
+          <Select.IndicatorGroup>
+            <Select.Indicator />
+          </Select.IndicatorGroup>
+        </Select.Control>
+        <Portal>
+          <Tooltip.Positioner>
+            <Tooltip.Content css={helperTooltip.content}>
+              <Tooltip.Arrow>
+                <Tooltip.ArrowTip css={helperTooltip.arrowTip} />
+              </Tooltip.Arrow>
+              Match the profile to your data so OpenZL can use its structure for better compression.
+            </Tooltip.Content>
+          </Tooltip.Positioner>
+        </Portal>
+      </Tooltip.Root>
       <Select.Positioner>
         <Select.Content color="pg.ink">
           {profileCollection.items.map((profile, index) => (
@@ -318,9 +337,9 @@ function ProfileSelect({row, position, onPatch}: OpenZlRowProps) {
                     be clipped by its overflow. */}
                   <Portal>
                     <Tooltip.Positioner>
-                      <Tooltip.Content>
+                      <Tooltip.Content css={helperTooltip.content}>
                         <Tooltip.Arrow>
-                          <Tooltip.ArrowTip />
+                          <Tooltip.ArrowTip css={helperTooltip.arrowTip} />
                         </Tooltip.Arrow>
                         {profileDescription(profile)}
                       </Tooltip.Content>
@@ -354,111 +373,130 @@ function levelsErrorId(rowId: number): string {
 /**
  * The levels a zstd or gzip row will be measured at. A multi-select rather than
  * a dropdown because each level is one point on the charts, so a row is a curve
- * rather than a value; the trigger reports the count for the same reason.
+ * rather than a value.
  *
  * Clearing every level is allowed and flagged rather than prevented: a picker
  * whose `None` leaves one box ticked reads as broken, and the row has to be
  * emptied before a single level can be chosen without unticking five first.
  */
 function LevelsPicker({row, position, onPatch}: {row: ZstdRow | GzipRow; position: number; onPatch: PatchRow}) {
+  const helperTooltip = useSlotRecipe({key: 'helperTooltip'})();
   const all = levelsFor(row.compressor);
   const selected = new Set(row.levels);
   const empty = row.levels.length === 0;
-  const levelsLabel = empty ? 'No levels' : row.levels.length === 1 ? '1 level' : `${String(row.levels.length)} levels`;
+  const levelsLabel = empty ? 'No levels' : row.levels.join(', ');
   const setLevels = (levels: readonly number[]) => {
     onPatch(row.id, row.compressor, {levels: [...levels].sort((a, b) => a - b)});
   };
 
   return (
-    <Popover.Root positioning={{placement: 'bottom-end'}}>
-      <Popover.Trigger asChild>
-        <Button
-          // The count leads so the accessible name contains the visible text:
-          // a voice-control user says what they can see. A static label would
-          // override it and leave them with nothing to say.
-          aria-label={`${levelsLabel}, row ${position}`}
-          aria-invalid={empty || undefined}
-          aria-describedby={empty ? levelsErrorId(row.id) : undefined}
-          width="140px"
-          flexShrink={0}
-          height="36px"
-          px="12px"
-          justifyContent="space-between"
-          fontSize="14px"
-          fontWeight="normal"
-          color={empty ? 'pg.danger' : 'pg.ink'}
-          bg="pg.surface"
-          borderWidth="1px"
-          borderColor={empty ? 'pg.danger' : 'pg.border'}
-          borderRadius="6px"
-          _hover={{bg: 'pg.surface'}}>
-          {levelsLabel}
-          <Box as="span" aria-hidden="true" display="inline-flex">
-            <LuChevronDown size={12} />
+    <Tooltip.Root openDelay={200} disabled={empty} positioning={{placement: 'top', gutter: 8}}>
+      <Popover.Root positioning={{placement: 'bottom-end'}}>
+        <Tooltip.Trigger asChild>
+          <Box as="span" display="inline-flex" flexShrink={0}>
+            <Popover.Trigger asChild>
+              <Button
+                // The levels lead so the accessible name contains the visible text:
+                // a voice-control user says what they can see. A static label would
+                // override it and leave them with nothing to say.
+                aria-label={`${levelsLabel}, row ${position}`}
+                aria-invalid={empty || undefined}
+                aria-describedby={empty ? levelsErrorId(row.id) : undefined}
+                width="140px"
+                flexShrink={0}
+                height="36px"
+                px="12px"
+                justifyContent="space-between"
+                fontSize="14px"
+                fontWeight="normal"
+                color={empty ? 'pg.danger' : 'pg.ink'}
+                bg="pg.surface"
+                borderWidth="1px"
+                borderColor={empty ? 'pg.danger' : 'pg.border'}
+                borderRadius="6px"
+                _hover={{bg: 'pg.surface'}}>
+                <Text as="span" flex="1" minW={0} truncate textAlign="left">
+                  {levelsLabel}
+                </Text>
+                <Box as="span" aria-hidden="true" display="inline-flex" flexShrink={0}>
+                  <LuChevronDown size={12} />
+                </Box>
+              </Button>
+            </Popover.Trigger>
           </Box>
-        </Button>
-      </Popover.Trigger>
-      <Portal>
-        <Popover.Positioner>
-          <Popover.Content width="220px" maxH="260px" overflowY="auto">
-            <Box
-              display="flex"
-              alignItems="center"
-              justifyContent="space-between"
-              px="12px"
-              py="10px"
-              borderBottomWidth="1px"
-              borderColor="pg.border">
-              <Text fontSize="11px" fontWeight="bold" color="pg.secondary" textTransform="uppercase" m={0}>
-                {row.compressor} levels
-              </Text>
-              <Box display="flex" gap="8px">
-                <chakra.button
-                  type="button"
-                  fontSize="12px"
-                  fontWeight="medium"
-                  color="pg.accent"
-                  onClick={() => setLevels(all)}>
-                  All
-                </chakra.button>
-                <chakra.button
-                  type="button"
-                  fontSize="12px"
-                  fontWeight="medium"
-                  color="pg.accent"
-                  onClick={() => setLevels([])}>
-                  None
-                </chakra.button>
+        </Tooltip.Trigger>
+        <Portal>
+          <Popover.Positioner>
+            <Popover.Content width="220px" maxH="260px" overflowY="auto">
+              <Box
+                display="flex"
+                alignItems="center"
+                justifyContent="space-between"
+                px="12px"
+                py="10px"
+                borderBottomWidth="1px"
+                borderColor="pg.border">
+                <Text fontSize="11px" fontWeight="bold" color="pg.secondary" textTransform="uppercase" m={0}>
+                  {row.compressor} levels
+                </Text>
+                <Box display="flex" gap="8px">
+                  <chakra.button
+                    type="button"
+                    fontSize="12px"
+                    fontWeight="medium"
+                    color="pg.accent"
+                    onClick={() => setLevels(all)}>
+                    All
+                  </chakra.button>
+                  <chakra.button
+                    type="button"
+                    fontSize="12px"
+                    fontWeight="medium"
+                    color="pg.accent"
+                    onClick={() => setLevels([])}>
+                    None
+                  </chakra.button>
+                </Box>
               </Box>
-            </Box>
-            {/* A column, because `Checkbox.Root` is inline-flex: as direct
+              {/* A column, because `Checkbox.Root` is inline-flex: as direct
                 children of the content they stretched, and inside a plain box
                 they would sit two to a line. */}
-            <Box role="group" aria-label={`${row.compressor} levels`} display="flex" flexDirection="column">
-              {all.map((level) => {
-                const checked = selected.has(level);
-                return (
-                  <Checkbox.Root
-                    key={level}
-                    px="12px"
-                    py="8px"
-                    checked={checked}
-                    onCheckedChange={() =>
-                      setLevels(checked ? row.levels.filter((l) => l !== level) : [...row.levels, level])
-                    }>
-                    <Checkbox.HiddenInput />
-                    <Checkbox.Control />
-                    <Checkbox.Label fontSize="13px" fontWeight="normal" color="pg.ink">
-                      Level {level}
-                    </Checkbox.Label>
-                  </Checkbox.Root>
-                );
-              })}
-            </Box>
-          </Popover.Content>
-        </Popover.Positioner>
+              <Box role="group" aria-label={`${row.compressor} levels`} display="flex" flexDirection="column">
+                {all.map((level) => {
+                  const checked = selected.has(level);
+                  return (
+                    <Checkbox.Root
+                      key={level}
+                      px="12px"
+                      py="8px"
+                      checked={checked}
+                      onCheckedChange={() =>
+                        setLevels(checked ? row.levels.filter((l) => l !== level) : [...row.levels, level])
+                      }>
+                      <Checkbox.HiddenInput />
+                      <Checkbox.Control />
+                      <Checkbox.Label fontSize="13px" fontWeight="normal" color="pg.ink">
+                        Level {level}
+                      </Checkbox.Label>
+                    </Checkbox.Root>
+                  );
+                })}
+              </Box>
+            </Popover.Content>
+          </Popover.Positioner>
+        </Portal>
+      </Popover.Root>
+      <Portal>
+        <Tooltip.Positioner>
+          <Tooltip.Content css={helperTooltip.content}>
+            <Tooltip.Arrow>
+              <Tooltip.ArrowTip css={helperTooltip.arrowTip} />
+            </Tooltip.Arrow>
+            {levelsLabel}
+          </Tooltip.Content>
+        </Tooltip.Positioner>
       </Portal>
-    </Popover.Root>
+    </Tooltip.Root>
   );
 }
 
