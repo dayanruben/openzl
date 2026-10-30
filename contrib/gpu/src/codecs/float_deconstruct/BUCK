@@ -3,13 +3,113 @@
 load("@fbcode_macros//build_defs:cpp_binary.bzl", "cpp_binary")
 load("@fbcode_macros//build_defs:cpp_library.bzl", "cpp_library")
 load("@fbcode_macros//build_defs:cpp_unittest.bzl", "cpp_unittest")
+load("@fbcode_macros//build_defs:sanitizers.bzl", "sanitizers")
 load("@fbcode_macros//build_defs/lib:re_test_utils.bzl", "re_test_utils")
 load("@fbsource//tools/build_defs:testpilot_defs.bzl", "tpx_labels")
 load("@fbsource//tools/build_defs/testinfra:network_access_utils.bzl", "network_access_utils")
+load("@fbsource//tools/target_determinator/macros:ci.bzl", "ci")
 load("//tools/build/buck:nvcc_flags.bzl", "get_nvcc_arch_args")
 load("../../../../../defs.bzl", "relative_headers")
 
 oncall("data_compression")
+
+# bf16 run descriptor and element decode, free of CUDA headers so that host
+# code shares them with the kernels.
+cpp_library(
+    # @autodeps-skip
+    name = "float_deconstruct_bf16",
+    headers = relative_headers(["float_deconstruct_bf16.hpp"]),
+    header_namespace = "",
+)
+
+# Checks whether a float_deconstruct codec run fits a kernel, and builds the
+# kernel's arguments. The kernels of every runtime share this code.
+cpp_library(
+    # @autodeps-skip
+    name = "decode_float_deconstruct_binding",
+    srcs = ["decode_float_deconstruct_binding.cpp"],
+    headers = relative_headers(["decode_float_deconstruct_binding.hpp"]),
+    header_namespace = "",
+    deps = ["../../../../..:zstronglib"],
+    exported_deps = [
+        "../../common:codec_decode_execution",
+        ":float_deconstruct_bf16",
+    ],
+)
+
+# The decode kernels of float_deconstruct for the CUDA runtime.
+cpp_library(
+    # @autodeps-skip
+    name = "decode_float_deconstruct_cuda",
+    srcs = ["decode_float_deconstruct_cuda.cpp"],
+    headers = relative_headers(["decode_float_deconstruct_cuda.hpp"]),
+    header_namespace = "",
+    deps = [
+        "../../../../..:zstronglib",
+        ":decode_float_deconstruct_bf16",
+        ":decode_float_deconstruct_binding",
+    ],
+    exported_deps = ["../../common:codec_decode_execution"],
+    external_deps = [("cuda", None, "cuda-lazy")],
+)
+
+cpp_unittest(
+    # @autodeps-skip
+    name = "decode_float_deconstruct_cuda_test",
+    srcs = ["tests/DecodeFloatDeconstructCudaTest.cpp"],
+    keep_gpu_sections = True,
+    labels = [tpx_labels.serialize]
+    + ci.labels(
+        ci.replace({ci.linux(ci.dev()): ci.linux(ci.mode("fbcode//mode/dev-nosan"))}),
+        ci.remove(ci.linux(ci.coverage(ci.mode("fbcode//mode/dev-cov")))),
+    ),
+    network_access = network_access_utils.none(),
+    remote_execution = re_test_utils.remote_execution(
+        platform = "gpu-remote-execution",
+        use_case = "tpx-default",
+    ),
+    target_compatible_with = sanitizers.sanitizer_enabled(
+        no = [],
+        yes = ["ovr_config//:none"],
+    ),
+    deps = [
+        "../../common:cuda_error",
+        "../../common:cuda_raii",
+        "../../device:cuda_device",
+        "fbsource//third-party/googletest:gtest",
+        ":bf16_test_frames",
+        ":decode_float_deconstruct_cuda",
+    ],
+    external_deps = [("cuda", None, "cuda-lazy")],
+)
+
+# Encoded bf16 float_deconstruct streams from real frames, for decoder tests.
+cpp_library(
+    # @autodeps-skip
+    name = "bf16_test_frames",
+    srcs = ["tests/bf16_test_frames.cpp"],
+    headers = relative_headers(["tests/bf16_test_frames.h"]),
+    header_namespace = "",
+    deps = [
+        "../../../../..:zstronglib",
+        "../../../../../cpp:openzl_cpp",
+        "../../../testkit:testkit",
+        "fbsource//third-party/googletest:gtest",
+    ],
+)
+
+cpp_unittest(
+    # @autodeps-skip
+    name = "decode_float_deconstruct_binding_test",
+    srcs = ["tests/DecodeFloatDeconstructBindingTest.cpp"],
+    network_access = network_access_utils.none(),
+    deps = [
+        "../../../../..:zstronglib",
+        "fbsource//third-party/googletest:gtest",
+        ":bf16_test_frames",
+        ":decode_float_deconstruct_binding",
+    ],
+)
 
 # GPU decode kernel for the bfloat16 float_deconstruct codec.
 cpp_library(
@@ -25,7 +125,8 @@ cpp_library(
     ],
     exported_deps = [
         "../../common:cuda_launch",
-        "../../common:segment_plan",
+        "../../common:slice_plan",
+        ":float_deconstruct_bf16",
     ],
     exported_external_deps = [("cuda", None, "cuda-lazy")],
 )
@@ -35,8 +136,8 @@ cpp_library(
 # ../../bench:gpu_bench.
 cpp_library(
     # @autodeps-skip
-    name = "gpu_chunk_harness",
-    headers = relative_headers(["gpu_chunk_harness.cuh"]),
+    name = "bf16_decon_element_ranges",
+    headers = relative_headers(["bf16_decon_element_ranges.cuh"]),
     header_namespace = "",
     exported_deps = [
         "../../common:cuda_error",
@@ -51,13 +152,14 @@ cpp_binary(
     # @autodeps-skip
     name = "bench_decode_bf16",
     srcs = ["bench/bench_decode_bf16.cu"],
+    keep_gpu_sections = True,
     nvcc_flags = get_nvcc_arch_args() + ["-lineinfo"],
     deps = [
         "../../../../..:zstronglib",
         "../../bench:gpu_bench",
         "../../common:cuda_error",
+        ":bf16_decon_element_ranges",
         ":decode_float_deconstruct_bf16",
-        ":gpu_chunk_harness",
     ],
     external_deps = [("cuda", None, "cuda-lazy")],
 )
@@ -68,6 +170,7 @@ cpp_unittest(
     # @autodeps-skip
     name = "decode_bf16_test",
     srcs = ["tests/DecodeBf16Test.cu"],
+    keep_gpu_sections = True,
     labels = [tpx_labels.serialize],
     network_access = network_access_utils.none(),
     nvcc_flags = get_nvcc_arch_args() + ["-lineinfo"],
@@ -81,8 +184,8 @@ cpp_unittest(
         "../../../testkit:testkit",
         "../../common:cuda_error",
         "fbsource//third-party/googletest:gtest",
+        ":bf16_decon_element_ranges",
         ":decode_float_deconstruct_bf16",
-        ":gpu_chunk_harness",
     ],
     external_deps = [("cuda", None, "cuda-lazy")],
 )

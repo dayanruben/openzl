@@ -2,6 +2,8 @@
 
 #include "custom_transforms/thrift/kernels/encode_thrift_binding.h"
 
+#include <string>
+
 #include <folly/memory/UninitializedMemoryHacks.h>
 
 #include "custom_transforms/thrift/kernels/encode_thrift_kernel.h"
@@ -132,7 +134,10 @@ ZL_Report typedTransform(ZL_Encoder* eictx, ZL_Input const* input) noexcept
 }
 
 template <typename Kernel>
-ZL_NodeID registerCTransform(ZL_Compressor* cgraph, ZL_IDType transformID)
+ZL_NodeID registerCTransform(
+        ZL_Compressor* cgraph,
+        ZL_IDType transformID,
+        char const* name = nullptr)
 {
     using KernelReturnType = std::invoke_result_t<Kernel, std::string_view&>;
     std::array<ZL_Type, 1 + std::tuple_size_v<KernelReturnType>> outStreamTypes;
@@ -147,8 +152,24 @@ ZL_NodeID registerCTransform(ZL_Compressor* cgraph, ZL_IDType transformID)
                         .nbOutStreams = outStreamTypes.size(),
                 },
                 .transform_f = typedTransform<Kernel>,
+                .name = name,
         };
     return ZL_Compressor_registerTypedEncoder(cgraph, &desc);
+}
+
+/// Registers the base transform node under @p name if not already registered.
+template <typename Kernel>
+ZL_NodeID registerCTransformBaseNode(
+        ZL_Compressor* cgraph,
+        ZL_IDType transformID,
+        std::string const& name)
+{
+    ZL_NodeID const node = ZL_Compressor_getNode(cgraph, name.c_str());
+    if (node.nid != ZL_NODE_ILLEGAL.nid) {
+        return node;
+    }
+    return registerCTransform<Kernel>(
+            cgraph, transformID, ("!" + name).c_str());
 }
 
 size_t unwrap(ZL_Report report)
@@ -188,7 +209,8 @@ ZL_NodeID ZS2_ThriftKernel_registerCTransformMapI32Float(
         }
     };
 
-    return registerCTransform<Transform>(cgraph, transformID);
+    return registerCTransformBaseNode<Transform>(
+            cgraph, transformID, "zl_custom.thrift_kernel_map_i32_float");
 }
 
 /// Input: Thrift Compact map<i32, list<float>>
@@ -227,7 +249,8 @@ ZL_NodeID ZS2_ThriftKernel_registerCTransformMapI32ArrayFloat(
         }
     };
 
-    return registerCTransform<Transform>(cgraph, transformID);
+    return registerCTransformBaseNode<Transform>(
+            cgraph, transformID, "zl_custom.thrift_kernel_map_i32_array_float");
 }
 
 /// Input: Thrift Compact map<i32, list<i64>>
@@ -266,7 +289,8 @@ ZL_NodeID ZS2_ThriftKernel_registerCTransformMapI32ArrayI64(
         }
     };
 
-    return registerCTransform<Transform>(cgraph, transformID);
+    return registerCTransformBaseNode<Transform>(
+            cgraph, transformID, "zl_custom.thrift_kernel_map_i32_array_i64");
 }
 
 /// Input: Thrift Compact map<i32, list<list<i64>>>
@@ -310,7 +334,10 @@ ZL_NodeID ZS2_ThriftKernel_registerCTransformMapI32ArrayArrayI64(
         }
     };
 
-    return registerCTransform<Transform>(cgraph, transformID);
+    return registerCTransformBaseNode<Transform>(
+            cgraph,
+            transformID,
+            "zl_custom.thrift_kernel_map_i32_array_array_i64");
 }
 
 /// Input: Thrift Compact map<i32, map<i64, float>>
@@ -354,7 +381,10 @@ ZL_NodeID ZS2_ThriftKernel_registerCTransformMapI32MapI64Float(
         }
     };
 
-    return registerCTransform<Transform>(cgraph, transformID);
+    return registerCTransformBaseNode<Transform>(
+            cgraph,
+            transformID,
+            "zl_custom.thrift_kernel_map_i32_map_i64_float");
 }
 
 /// Input: Thrift Compact list<i64>
@@ -378,7 +408,8 @@ ZL_NodeID ZS2_ThriftKernel_registerCTransformArrayI64(
         }
     };
 
-    return registerCTransform<Transform>(cgraph, transformID);
+    return registerCTransform<Transform>(
+            cgraph, transformID, "!zl_custom.thrift_kernel_array_i64");
 }
 
 /// Input: Thrift Compact list<i32>
