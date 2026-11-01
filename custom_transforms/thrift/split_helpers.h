@@ -71,32 +71,6 @@ class ReadStream {
         return val;
     }
 
-    /// @returns true if at least @p numElts values of type @p Value can be
-    /// read from the stream without running past its end. Overflow-safe.
-    template <typename Value>
-    ZL_FORCE_INLINE_ATTR bool canReadValues(size_t numElts) const
-    {
-        return numElts <= buf_.size() / sizeof(Value);
-    }
-
-    ZL_FORCE_INLINE_ATTR size_t bytesRemaining() const
-    {
-        return buf_.size();
-    }
-
-    /// Reads a value of type @p Value without bounds-checking.
-    /// @pre The caller has verified that sizeof(Value) bytes remain (e.g. via
-    ///      canReadValues() or bytesRemaining()).
-    template <typename Value>
-    ZL_FORCE_INLINE_ATTR Value readValueUnchecked()
-    {
-        static_assert(folly::kIsLittleEndian);
-        Value val;
-        std::memcpy(&val, buf_.start(), sizeof(Value));
-        buf_ = { buf_.start() + sizeof(Value), buf_.end() };
-        return val;
-    }
-
     ZL_FORCE_INLINE_ATTR uint64_t readVarint()
     {
         const uint8_t* ptr = buf_.data();
@@ -195,39 +169,6 @@ class BaseWriteStream {
             derived().commit(commitSize);
         } else {
             derived().reserve(ZL_VARINT_FAST_OVERWRITE_32);
-            size_t const commitSize =
-                    ZL_varintEncode32Fast(val, derived().wptr());
-            assert(commitSize <= ZL_VARINT_LENGTH_32);
-            derived().commit(commitSize);
-        }
-    }
-
-    // Like writeValue() but skips the reserve() bounds check. The caller must
-    // guarantee there is room for sizeof(Value) more bytes.
-    template <typename Value>
-    ZL_FORCE_INLINE_ATTR void writeValueUnchecked(Value val)
-    {
-        static_assert(folly::kIsLittleEndian);
-        std::copy(
-                (const uint8_t*)(&val),
-                (const uint8_t*)(&val) + sizeof(Value),
-                derived().wptr());
-        derived().commit(sizeof(Value));
-    }
-
-    // Like writeVarint() but skips the reserve() bounds check. The caller must
-    // guarantee there is room for ZL_VARINT_FAST_OVERWRITE_{32,64} more bytes.
-    template <typename UInt>
-    ZL_FORCE_INLINE_ATTR void writeVarintUnchecked(UInt val)
-    {
-        static_assert(std::is_integral_v<UInt> && !std::is_signed_v<UInt>);
-        assert(derived().width() == 1);
-        if constexpr (sizeof(UInt) > 4) {
-            size_t const commitSize =
-                    ZL_varintEncode64Fast(val, derived().wptr());
-            assert(commitSize <= ZL_VARINT_LENGTH_64);
-            derived().commit(commitSize);
-        } else {
             size_t const commitSize =
                     ZL_varintEncode32Fast(val, derived().wptr());
             assert(commitSize <= ZL_VARINT_LENGTH_32);
@@ -437,13 +378,6 @@ class FixedWriteStream : public detail::BaseWriteStream<FixedWriteStream> {
         if (n > size_t(end_ - ptr_)) {
             throw std::runtime_error{ "Not enough space in buffer" };
         }
-    }
-
-    // True if there is room to write @p n more bytes without overflowing.
-    ZL_FORCE_INLINE_ATTR bool canWrite(size_t n) const
-    {
-        assert(ptr_ <= end_);
-        return n <= size_t(end_ - ptr_);
     }
 
     // Note: invalidated by commit() and all write.*() methods
