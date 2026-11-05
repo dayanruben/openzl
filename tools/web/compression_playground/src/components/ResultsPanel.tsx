@@ -2,8 +2,10 @@
 
 import {useState} from 'react';
 import {Box, Heading, Text, VStack} from '@chakra-ui/react';
-import {LuArrowRight, LuChartLine, LuChartSpline, LuMicroscope, LuMonitor} from 'react-icons/lu';
+import {LuChartLine, LuChartSpline, LuMicroscope} from 'react-icons/lu';
 import {isRunInProgress, type BenchmarkJob, type Candidate, type JobResult, type RunState} from '../benchmarkTypes.ts';
+import {toggleCodec} from '../charts.ts';
+import type {CompressorName} from '../compressors.ts';
 import {formatBytes, measurementKey, resultsOf} from '../measurements.ts';
 import MeasurementsTable from './MeasurementsTable.tsx';
 import RatioSpeedCharts from './RatioSpeedCharts.tsx';
@@ -73,6 +75,19 @@ export default function ResultsPanel({runState}: ResultsPanelProps) {
   // made on, which keeps a key from the last run off the same job in this one.
   const [hovered, setHovered] = useState<{key: string; results: readonly JobResult[]} | null>(null);
   const highlighted = !isRunning && hovered?.results === results ? hovered.key : null;
+  // The codecs switched off in the legend, for the charts and the table alike.
+  // Kept while there are results, so a codec hidden mid-run stays hidden as its
+  // points arrive, and dropped once the next run clears them.
+  const [hidden, setHidden] = useState<ReadonlySet<CompressorName>>(new Set());
+  if (!hasResults && hidden.size > 0) {
+    setHidden(new Set());
+  }
+  const onToggle = (compressor: CompressorName) => {
+    setHidden((current) => toggleCodec(current, compressor));
+    // Rows that go away under a pointer that has not moved send no leave, and
+    // the key would pick the row out again when its codec comes back.
+    setHovered(null);
+  };
   return (
     <Box
       as="section"
@@ -107,9 +122,12 @@ export default function ResultsPanel({runState}: ResultsPanelProps) {
             Run failed: {runState.message}
           </Text>
         )}
-        {hasResults && <RatioSpeedCharts results={results} highlighted={highlighted} />}
+        {hasResults && (
+          <RatioSpeedCharts results={results} highlighted={highlighted} hidden={hidden} onToggle={onToggle} />
+        )}
         <MeasurementsTable
           runState={runState}
+          hidden={hidden}
           onHighlight={isRunning ? undefined : (key) => setHovered(key === null ? null : {key, results})}
         />
         <FailureList runState={runState} />
@@ -228,8 +246,7 @@ export default function ResultsPanel({runState}: ResultsPanelProps) {
                     </Text>
                     These charts compare compression ratio against speed. The left chart shows compression speed, the
                     right shows decompression speed. Points toward the top-right perform best. Hover over a point to see
-                    details, or click a row in the benchmarking table to explore its compression graph through the
-                    visualization tool.
+                    details.
                   </Text>
                 </Box>
                 <Box as="li" display="flex" alignItems="flex-start" gap="12px">
@@ -254,26 +271,6 @@ export default function ResultsPanel({runState}: ResultsPanelProps) {
                 </Box>
               </VStack>
             </VStack>
-
-            <Box as="aside" aria-label="Desktop app recommendation" bg="pg.callout" borderRadius="12px" p="24px">
-              <VStack gap="12px" align="stretch">
-                <Box display="flex" alignItems="center" gap="10px" color="pg.ink" fontSize="15px" fontWeight="bold">
-                  <LuMonitor size={18} aria-hidden="true" />
-                  Get large files? Use the desktop app.
-                </Box>
-                <Text color="pg.ink" fontSize="14px" lineHeight="1.5" opacity={0.9} m={0}>
-                  The <Text as="strong">OpenZL Playground desktop app</Text> runs these exact benchmarks entirely on
-                  your own machine: it reads files straight off disk, so there is no practical size limit, training runs
-                  and Pareto frontiers all stay local.
-                </Text>
-                {/* Text, not Link, until the desktop app has a URL: an anchor with
-                  no href gets neither the link role nor keyboard focus, so it
-                  would only look interactive. */}
-                <Text color="pg.accent" fontSize="14px" fontWeight="bold" m={0}>
-                  Use the desktop app <LuArrowRight size={14} aria-hidden="true" />
-                </Text>
-              </VStack>
-            </Box>
           </>
         )}
       </VStack>
